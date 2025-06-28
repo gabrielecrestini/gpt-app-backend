@@ -243,3 +243,24 @@ def place_bet(bet_data: TradingBetRequest):
         return {"status": "success", "message": "Scommessa piazzata."}
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore nel piazzare la scommessa.")
+        
+# --- Endpoint Postback ---
+@app.get("/postback/{provider}")
+async def postback_handler(provider: str, request: Request):
+    params = request.query_params
+    user_id = params.get("user_id") or params.get("uid")
+    amount_str = params.get("amount") or params.get("payout")
+    
+    if not user_id or not amount_str:
+        raise HTTPException(status_code=400, detail="Parametri 'user_id' e 'amount' mancanti")
+    try:
+        amount = float(amount_str)
+        user_data = supabase.table('users').select('balance').eq('user_id', user_id).single().execute()
+        if not user_data.data:
+            raise HTTPException(status_code=404, detail=f"Utente {user_id} non trovato.")
+        
+        new_balance = user_data.data.get('balance', 0) + amount
+        supabase.table('users').update({'balance': new_balance}).eq('user_id', user_id).execute()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Errore interno del server.")
