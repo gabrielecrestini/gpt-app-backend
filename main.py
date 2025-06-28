@@ -1,4 +1,4 @@
-# main.py - Versione 12 (con Dati di Mercato Reali e Logica Completa)
+# main.py - Versione Finale Definitiva
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -30,6 +30,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Costanti di Gioco ---
+POINTS_TO_EUR_RATE = 1000.0
+
 # --- Modelli Dati ---
 class UserSyncRequest(BaseModel):
     user_id: str; email: str | None; displayName: str | None = None
@@ -40,29 +43,23 @@ class ProfileUpdateRequest(BaseModel):
     avatar_url: str
 
 class PayoutRequest(BaseModel):
-    user_id: str; amount: float; method: str; address: str
+    user_id: str
+    points_amount: int
+    method: str 
+    address: str
 
 class TradingBetRequest(BaseModel):
-    user_id: str; amount: float; direction: str; asset: str
+    user_id: str
+    amount: float
+    direction: str
+    asset: str
 
-# --- Dati di base per Gamification ---
-mock_community_goal = {"target": 10000, "reward": "+5% Guadagni per 24h"}
-possible_missions = [
-    {"id": 1, "title": "Completa 3 sondaggi", "target": 3, "reward": 50},
-    {"id": 2, "title": "Guadagna 5€ in un giorno", "target": 5, "reward": 100},
-    {"id": 3, "title": "Invita un amico", "target": 1, "reward": 200},
-]
-wheel_prizes = [
-    {'label': '10 Monete', 'type': 'coins', 'value': 10, 'weight': 30},
-    {'label': 'Jackpot!', 'type': 'coins', 'value': 100, 'weight': 2},
-]
-
-
-# --- Endpoint ---
+# --- Endpoint di Base ---
 @app.get("/")
 def read_root():
     return {"message": "Zenith Rewards Backend API. Tutti i sistemi sono attivi."}
 
+# --- Gestione Utenti ---
 @app.post("/sync_user")
 def sync_user(user_data: UserSyncRequest):
     try:
@@ -73,7 +70,8 @@ def sync_user(user_data: UserSyncRequest):
             user_record = { 
                 'user_id': user_data.user_id, 'email': user_data.email, 
                 'display_name': user_data.displayName, 'referrer_id': user_data.referrer_id, 
-                'avatar_url': user_data.avatar_url, 'last_login_at': now.isoformat(), 'login_streak': 1
+                'avatar_url': user_data.avatar_url, 'login_streak': 1,
+                'last_login_at': now.isoformat(), 'points_balance': 0
             }
             supabase.table('users').insert(user_record).execute()
         else: # Utente esistente, aggiorna streak
@@ -92,19 +90,6 @@ def sync_user(user_data: UserSyncRequest):
         print(f"Errore in sync_user: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/update_profile/{user_id}")
-def update_profile_endpoint(user_id: str, profile_data: ProfileUpdateRequest):
-    try:
-        data, count = supabase.table('users').update({
-            'display_name': profile_data.display_name,
-            'avatar_url': profile_data.avatar_url
-        }).eq('user_id', user_id).execute()
-        if not data or (isinstance(data, list) and len(data) > 1 and not data[1]):
-            raise HTTPException(status_code=404, detail="User not found")
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/get_user_balance/{user_id}")
 def get_user_balance(user_id: str):
     try:
@@ -113,21 +98,23 @@ def get_user_balance(user_id: str):
             return {"user_id": user_id, "points_balance": response.data[0].get('points_balance', 0)}
         return {"user_id": user_id, "points_balance": 0}
     except Exception as e:
+        print(f"Error in get_user_balance: {e}")
         raise HTTPException(status_code=500, detail="Errore nel recupero del saldo.")
 
+# --- Sistema di Prelievi Reale ---
 @app.post("/request_payout")
 def request_payout(payout_data: PayoutRequest):
     try:
         user_response = supabase.table('users').select('points_balance').eq('user_id', payout_data.user_id).single().execute()
-        if not user_response.data or user_response.data.get('points_balance', 0) < payout_data.amount:
+        if not user_response.data or user_response.data.get('points_balance', 0) < payout_data.points_amount:
             raise HTTPException(status_code=400, detail="Punti insufficienti.")
         
-        new_balance = user_response.data.get('points_balance', 0) - payout_data.amount
+        new_balance = user_response.data.get('points_balance', 0) - payout_data.points_amount
         supabase.table('users').update({'points_balance': new_balance}).eq('user_id', payout_data.user_id).execute()
         
-        value_in_eur = payout_data.amount / 1000.0
+        value_in_eur = payout_data.points_amount / POINTS_TO_EUR_RATE
         supabase.table('payout_requests').insert({
-            'user_id': payout_data.user_id, 'points_amount': payout_data.amount,
+            'user_id': payout_data.user_id, 'points_amount': payout_data.points_amount,
             'value_in_eur': value_in_eur, 'payout_method': payout_data.method, 
             'wallet_address': payout_data.address, 'status': 'pending'
         }).execute()
@@ -137,7 +124,7 @@ def request_payout(payout_data: PayoutRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore nell'elaborazione della richiesta.")
 
-# --- Sistema di Trading con Dati Reali ---
+# --- Sistema di Trading Reale ---
 supported_assets = ["BTC-USD", "ETH-USD", "DOGE-USD"]
 
 @app.get("/trading/price/{asset_ticker}")
@@ -148,7 +135,10 @@ def get_asset_price(asset_ticker: str):
         ticker = yf.Ticker(asset_ticker)
         price_data = ticker.history(period="1d", interval="1m")
         if price_data.empty:
-            return {"asset": asset_ticker, "price": random.uniform(60000, 65000)} # Fallback
+            # Fallback a dati casuali se l'API fallisce
+            if asset_ticker == "BTC-USD": return {"price": random.uniform(60000, 65000)}
+            if asset_ticker == "ETH-USD": return {"price": random.uniform(3000, 3500)}
+            if asset_ticker == "DOGE-USD": return {"price": random.uniform(0.10, 0.15)}
         current_price = price_data['Close'][-1]
         return {"asset": asset_ticker, "price": round(current_price, 4)}
     except Exception as e:
@@ -177,7 +167,7 @@ def place_bet(bet_data: TradingBetRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore nel piazzare la scommessa.")
 
-# --- Endpoint Gamification ---
+# --- Endpoint Gamification con Logica Reale ---
 @app.get("/leaderboard")
 def get_leaderboard():
     try:
@@ -197,9 +187,27 @@ def get_streak_status(user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore nel recuperare lo streak.")
 
-@app.get("/missions/{user_id}")
-def get_user_missions(user_id: str):
-    missions = random.sample(possible_missions, 3)
-    for mission in missions:
-        mission['progress'] = round(random.uniform(0, mission['target']), 1)
-    return missions
+# --- Endpoint Postback ---
+@app.get("/postback/{provider}")
+async def postback_handler(provider: str, request: Request):
+    params = request.query_params
+    user_id = params.get("user_id") or params.get("uid")
+    amount_str = params.get("amount") or params.get("payout")
+    
+    if not user_id or not amount_str:
+        raise HTTPException(status_code=400, detail="Parametri 'user_id' e 'amount' mancanti")
+    try:
+        # L'importo dal postback è in EURO, lo convertiamo in Zenith Coins
+        amount_eur = float(amount_str)
+        points_earned = int(amount_eur * POINTS_TO_EUR_RATE)
+
+        user_data = supabase.table('users').select('points_balance').eq('user_id', user_id).single().execute()
+        if not user_data.data:
+            raise HTTPException(status_code=404, detail=f"Utente {user_id} non trovato.")
+        
+        new_balance = user_data.data.get('points_balance', 0) + points_earned
+        supabase.table('users').update({'points_balance': new_balance}).eq('user_id', user_id).execute()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Errore interno del server.")
+
