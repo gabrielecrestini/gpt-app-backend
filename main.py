@@ -177,4 +177,8 @@ def spin_wheel(user_id: str):
         supabase.table('users').update({'last_spin_at': datetime.now(timezone.utc).isoformat()}).eq('user_id', user_id).execute()
         return {"prize": prize, "prize_index": prize_index}
     except Exception as e:
+<<<<<<< HEAD
         raise HTTPException(status_code=500, detail="Errore durante il giro della ruota.")
+=======
+        raise HTTPException(status_code=500, detail="Errore durante il giro della ruota.")
+>>>>>>> c993d7191fb0201da77fb02576d3fb93e1734a8a
