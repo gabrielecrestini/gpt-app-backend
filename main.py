@@ -1,10 +1,11 @@
-# main.py - Versione Finale Definitiva
+# main.py - Versione 12 (con Dati di Mercato Reali)
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from supabase import create_client, Client
 import os
 import random
 from datetime import datetime, timedelta, timezone
+import yfinance as yf # Libreria per i dati di mercato reali
 
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,10 +21,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI(title="Zenith Rewards Backend")
 
 # --- Configurazione CORS ---
-origins = [
-    "http://localhost:3000",
-    "https://cashhh-52f38.web.app", # Il tuo URL di produzione
-]
+origins = [ "http://localhost:3000", "https://cashhh-52f38.web.app" ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -34,28 +32,20 @@ app.add_middleware(
 
 # --- Modelli Dati ---
 class UserSyncRequest(BaseModel):
-    user_id: str
-    email: str | None
-    displayName: str | None = None
-    referrer_id: str | None = None
-    avatar_url: str | None = None
+    user_id: str; email: str | None; displayName: str | None = None
+    referrer_id: str | None = None; avatar_url: str | None = None
 
 class ProfileUpdateRequest(BaseModel):
     display_name: str
     avatar_url: str
 
 class PayoutRequest(BaseModel):
-    user_id: str
-    amount: float
-    method: str 
-    address: str
+    user_id: str; amount: float; method: str; address: str
 
 class TradingBetRequest(BaseModel):
-    user_id: str
-    amount: float
-    direction: str
+    user_id: str; amount: float; direction: str; asset: str
 
-# --- Dati di base per Gamification ---
+# --- Dati Fittizi (usati solo come fallback o per missioni) ---
 mock_community_goal = {"target": 10000, "reward": "+5% Guadagni per 24h"}
 possible_missions = [
     {"id": 1, "title": "Completa 3 sondaggi", "target": 3, "reward": 50},
@@ -66,37 +56,24 @@ wheel_prizes = [
     {'label': '10 Monete', 'type': 'coins', 'value': 10, 'weight': 30},
     {'label': 'Jackpot!', 'type': 'coins', 'value': 100, 'weight': 2},
 ]
-current_btc_price = 65000.00
+
 
 # --- Endpoint ---
 @app.get("/")
 def read_root():
-    return {"message": "Zenith Rewards Backend API. Tutti i sistemi sono attivi."}
+    return {"message": "Zenith Rewards Backend API. Dati di mercato reali attivi."}
 
 @app.post("/sync_user")
 def sync_user(user_data: UserSyncRequest):
     try:
-        user_res = supabase.table('users').select('user_id, last_login_at, login_streak').eq('user_id', user_data.user_id).execute()
-        now = datetime.now(timezone.utc)
-        
-        if not user_res.data: # Nuovo utente
+        user_res = supabase.table('users').select('user_id').eq('user_id', user_data.user_id).execute()
+        if not user_res.data:
             user_record = { 
                 'user_id': user_data.user_id, 'email': user_data.email, 
                 'display_name': user_data.displayName, 'referrer_id': user_data.referrer_id, 
-                'avatar_url': user_data.avatar_url, 'last_login_at': now.isoformat(), 'login_streak': 1
+                'avatar_url': user_data.avatar_url
             }
             supabase.table('users').insert(user_record).execute()
-        else: # Utente esistente, aggiorna streak
-            user = user_res.data[0]
-            last_login = datetime.fromisoformat(user.get('last_login_at')) if user.get('last_login_at') else now - timedelta(days=2)
-            streak = user.get('login_streak', 0)
-            if (now.date() - last_login.date()).days == 1:
-                streak += 1
-            elif (now.date() - last_login.date()).days > 1:
-                streak = 1
-            
-            supabase.table('users').update({'last_login_at': now.isoformat(), 'login_streak': streak}).eq('user_id', user_data.user_id).execute()
-            
         return {"status": "success"}
     except Exception as e:
         print(f"Errore in sync_user: {e}")
@@ -123,6 +100,7 @@ def get_user_balance(user_id: str):
             return {"user_id": user_id, "balance": response.data[0].get('balance', 0)}
         return {"user_id": user_id, "balance": 0}
     except Exception as e:
+        print(f"Error in get_user_balance: {e}")
         raise HTTPException(status_code=500, detail="Errore nel recupero del saldo.")
 
 @app.post("/request_payout")
@@ -131,10 +109,10 @@ def request_payout(payout_data: PayoutRequest):
         user_response = supabase.table('users').select('balance').eq('user_id', payout_data.user_id).single().execute()
         if not user_response.data or user_response.data.get('balance', 0) < payout_data.amount:
             raise HTTPException(status_code=400, detail="Saldo insufficiente.")
-
+        
         new_balance = user_response.data.get('balance', 0) - payout_data.amount
         supabase.table('users').update({'balance': new_balance}).eq('user_id', payout_data.user_id).execute()
-
+        
         supabase.table('payout_requests').insert({
             'user_id': payout_data.user_id, 'amount': payout_data.amount,
             'payout_method': payout_data.method, 'wallet_address': payout_data.address,
@@ -146,8 +124,49 @@ def request_payout(payout_data: PayoutRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore nell'elaborazione della richiesta.")
 
-# --- Endpoint Gamification con Logica Reale ---
+# --- Sistema di Trading con Dati Reali ---
+supported_assets = ["BTC-USD", "ETH-USD", "DOGE-USD"]
 
+@app.get("/trading/price/{asset_ticker}")
+def get_asset_price(asset_ticker: str):
+    """Recupera il prezzo quasi in tempo reale di un asset."""
+    if asset_ticker not in supported_assets:
+        raise HTTPException(status_code=404, detail="Asset non supportato.")
+    try:
+        ticker = yf.Ticker(asset_ticker)
+        price_data = ticker.history(period="1d", interval="1m")
+        if price_data.empty:
+            raise HTTPException(status_code=404, detail="Dati non disponibili per questo asset.")
+        current_price = price_data['Close'][-1]
+        return {"asset": asset_ticker, "price": round(current_price, 4)}
+    except Exception as e:
+        print(f"Errore API yfinance: {e}")
+        raise HTTPException(status_code=500, detail="Impossibile recuperare i dati di mercato.")
+
+@app.post("/trading/place_bet")
+def place_bet(bet_data: TradingBetRequest):
+    try:
+        user_response = supabase.table('users').select('balance').eq('user_id', bet_data.user_id).single().execute()
+        if not user_response.data or user_response.data.get('balance', 0) < bet_data.amount:
+            raise HTTPException(status_code=400, detail="Punti insufficienti.")
+        
+        new_balance = user_response.data.get('balance', 0) - bet_data.amount
+        supabase.table('users').update({'balance': new_balance}).eq('user_id', bet_data.user_id).execute()
+        
+        asset_price_data = get_asset_price(f"{bet_data.asset}-USD")
+        initial_price = asset_price_data['price']
+
+        supabase.table('trading_bets').insert({
+            'user_id': bet_data.user_id, 'direction': bet_data.direction,
+            'amount_bet': bet_data.amount, 'asset': bet_data.asset,
+            'status': 'active', 'initial_price': initial_price
+        }).execute()
+        
+        return {"status": "success", "message": "Scommessa piazzata."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Errore nel piazzare la scommessa.")
+
+# --- Endpoint di Gamification ---
 @app.get("/leaderboard")
 def get_leaderboard():
     try:
@@ -157,32 +176,6 @@ def get_leaderboard():
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore nel caricare la classifica.")
 
-@app.get("/community_goal")
-def get_community_goal():
-    try:
-        response = supabase.table('users').select('balance').execute()
-        total_balance = sum(u.get('balance', 0) for u in response.data)
-        return {"current": total_balance, "target": mock_community_goal['target'], "reward": mock_community_goal['reward']}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Errore nel caricare l'obiettivo community.")
-
-@app.get("/streak/status/{user_id}")
-def get_streak_status(user_id: str):
-    try:
-        response = supabase.table('users').select('login_streak').eq('user_id', user_id).single().execute()
-        if not response.data:
-            return {"days": 0, "canClaim": False}
-        return {"days": response.data.get('login_streak', 0), "canClaim": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Errore nel recuperare lo streak.")
-
-@app.get("/missions/{user_id}")
-def get_user_missions(user_id: str):
-    missions = random.sample(possible_missions, 3)
-    for mission in missions:
-        mission['progress'] = round(random.uniform(0, mission['target']), 1)
-    return missions
-
 @app.get("/referral_stats/{user_id}")
 def get_referral_stats(user_id: str):
     try:
@@ -190,77 +183,3 @@ def get_referral_stats(user_id: str):
         return {"referral_count": response.count or 0, "referral_earnings": 0.00}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# --- Endpoint Trading e Ruota ---
-
-@app.get("/wheel/status/{user_id}")
-def get_wheel_status(user_id: str):
-    try:
-        response = supabase.table('users').select('last_spin_at').eq('user_id', user_id).single().execute()
-        if not response.data or not response.data.get('last_spin_at'):
-            return {"can_spin": True}
-        last_spin_time = datetime.fromisoformat(response.data['last_spin_at'])
-        if (datetime.now(timezone.utc) - last_spin_time) > timedelta(hours=24):
-            return {"can_spin": True}
-        else:
-            return {"can_spin": False}
-    except Exception:
-        return {"can_spin": True}
-
-@app.post("/wheel/spin/{user_id}")
-def spin_wheel(user_id: str):
-    if not get_wheel_status(user_id).get("can_spin"):
-        raise HTTPException(status_code=403, detail="Non puoi ancora girare la ruota.")
-    try:
-        population = [p for p in wheel_prizes for _ in range(p['weight'])]
-        prize = random.choice(population)
-        prize_index = next((i for i, p in enumerate(wheel_prizes) if p['label'] == prize['label']), 0)
-        if prize['type'] == 'coins':
-            user_data = supabase.table('users').select('balance').eq('user_id', user_id).single().execute()
-            new_balance = user_data.data.get('balance', 0) + prize['value']
-            supabase.table('users').update({'balance': new_balance}).eq('user_id', user_id).execute()
-        supabase.table('users').update({'last_spin_at': datetime.now(timezone.utc).isoformat()}).eq('user_id', user_id).execute()
-        return {"prize": prize, "prize_index": prize_index}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Errore durante il giro della ruota.")
-
-@app.get("/trading/btc_price")
-def get_btc_price():
-    global current_btc_price
-    change = current_btc_price * random.uniform(-0.001, 0.001)
-    current_btc_price += change
-    return {"price": round(current_btc_price, 2)}
-
-@app.post("/trading/place_bet")
-def place_bet(bet_data: TradingBetRequest):
-    try:
-        user_response = supabase.table('users').select('balance').eq('user_id', bet_data.user_id).single().execute()
-        if not user_response.data or user_response.data.get('balance', 0) < bet_data.amount:
-            raise HTTPException(status_code=400, detail="Punti insufficienti per la scommessa.")
-        new_balance = user_response.data.get('balance', 0) - bet_data.amount
-        supabase.table('users').update({'balance': new_balance}).eq('user_id', bet_data.user_id).execute()
-        supabase.table('trading_bets').insert({'user_id': bet_data.user_id, 'direction': bet_data.direction, 'amount_bet': bet_data.amount, 'status': 'active', 'initial_price': current_btc_price}).execute()
-        return {"status": "success", "message": "Scommessa piazzata."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Errore nel piazzare la scommessa.")
-        
-# --- Endpoint Postback ---
-@app.get("/postback/{provider}")
-async def postback_handler(provider: str, request: Request):
-    params = request.query_params
-    user_id = params.get("user_id") or params.get("uid")
-    amount_str = params.get("amount") or params.get("payout")
-    
-    if not user_id or not amount_str:
-        raise HTTPException(status_code=400, detail="Parametri 'user_id' e 'amount' mancanti")
-    try:
-        amount = float(amount_str)
-        user_data = supabase.table('users').select('balance').eq('user_id', user_id).single().execute()
-        if not user_data.data:
-            raise HTTPException(status_code=404, detail=f"Utente {user_id} non trovato.")
-        
-        new_balance = user_data.data.get('balance', 0) + amount
-        supabase.table('users').update({'balance': new_balance}).eq('user_id', user_id).execute()
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Errore interno del server.")
