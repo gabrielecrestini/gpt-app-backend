@@ -1,12 +1,18 @@
-# main.py - Versione Finale Definitiva (con Missioni e Gamification Reale)
+# main.py - Versione Finale Definitiva (con IA Reale e fix)
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from supabase import create_client, Client
 import os
 import random
+import json
+import base64
 from datetime import datetime, timedelta, timezone
+
+# Librerie per l'IA di Google e Pagamenti
+import vertexai
+from vertexai.generative_models import GenerativeModel
+from vertexai.preview.vision_models import ImageGenerationModel
 import requests
-import yfinance as yf
 
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,8 +25,19 @@ PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
 PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
 PAYPAL_API_BASE_URL = "https://api-m.paypal.com"
 
-if not all([SUPABASE_URL, SUPABASE_KEY]):
-    raise ValueError("Errore: mancano le variabili d'ambiente di Supabase.")
+# Configurazione Google Cloud AI
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
+GCP_REGION = os.environ.get("GCP_REGION")
+GCP_SA_KEY_JSON_STR = os.environ.get("GCP_SA_KEY_JSON")
+
+if not all([SUPABASE_URL, SUPABASE_KEY, GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
+    print("ATTENZIONE: Mancano una o più variabili d'ambiente essenziali (Supabase o Google Cloud).")
+
+try:
+    gcp_credentials_info = json.loads(GCP_SA_KEY_JSON_STR)
+    vertexai.init(project=GCP_PROJECT_ID, location=GCP_REGION)
+except Exception as e:
+    print(f"ATTENZIONE: Errore nella configurazione delle credenziali Google Cloud: {e}")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI(title="Zenith Rewards Backend")
@@ -37,6 +54,7 @@ app.add_middleware(
 
 # --- Costanti e Modelli ---
 POINTS_TO_EUR_RATE = 1000.0
+IMAGE_GENERATION_COST = 50
 
 class UserSyncRequest(BaseModel):
     user_id: str; email: str | None; displayName: str | None = None
@@ -45,15 +63,11 @@ class UserSyncRequest(BaseModel):
 class PayoutRequest(BaseModel):
     user_id: str; points_amount: int; method: str; address: str
 
-# --- Dati Fittizi per Missioni e Obiettivi ---
-possible_missions = [
-    {"id": 1, "title": "Completa 3 sondaggi", "target": 3, "reward": 50},
-    {"id": 2, "title": "Guadagna 500 ZC in un giorno", "target": 500, "reward": 100},
-    {"id": 3, "title": "Invita un amico", "target": 1, "reward": 200},
-    {"id": 4, "title": "Guarda 10 video", "target": 10, "reward": 20},
-]
-mock_community_goal = {"target": 100000, "reward": "+5% Guadagni per 24h"}
+class ImageGenerationRequest(BaseModel):
+    user_id: str; prompt: str; contest_id: int
 
+class SubmissionRequest(BaseModel):
+    contest_id: int; user_id: str; image_url: str; prompt: str
 
 # --- Endpoint di Base ---
 @app.get("/")
@@ -77,17 +91,22 @@ def sync_user(user_data: UserSyncRequest):
             supabase.table('users').insert(user_record).execute()
         else: # Utente esistente, aggiorna streak
             user = user_res.data[0]
-            last_login = datetime.fromisoformat(user.get('last_login_at')) if user.get('last_login_at') else now - timedelta(days=2)
+            last_login_str = user.get('last_login_at')
             streak = user.get('login_streak', 0)
-            if (now.date() - last_login.date()).days == 1:
-                streak += 1
-            elif (now.date() - last_login.date()).days > 1:
+            if last_login_str:
+                last_login = datetime.fromisoformat(last_login_str)
+                if (now.date() - last_login.date()).days == 1:
+                    streak += 1
+                elif (now.date() - last_login.date()).days > 1:
+                    streak = 1
+            else:
                 streak = 1
             
             supabase.table('users').update({'last_login_at': now.isoformat(), 'login_streak': streak}).eq('user_id', user_data.user_id).execute()
             
         return {"status": "success"}
     except Exception as e:
+        print(f"Errore in sync_user: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get_user_balance/{user_id}")
@@ -121,38 +140,74 @@ def request_payout(payout_data: PayoutRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore nell'elaborazione della richiesta.")
 
-# --- Endpoint Gamification con Logica Reale ---
+# --- Sistema "Zenith Art Battles" con IA Reale ---
+def generate_daily_theme():
+    try:
+        model = GenerativeModel("gemini-1.0-pro")
+        prompt = "Genera un tema artistico breve, creativo e stimolante (massimo 10 parole) per una competizione di arte digitale. Fornisci solo il testo del tema, senza virgolette o prefissi."
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print(f"Errore generazione tema: {e}")
+        return "Un drago fatto di cristalli"
+
+@app.get("/contests/current")
+def get_current_contest():
+    try:
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        response = supabase.table('ai_contests').select('*').gte('created_at', today_start.isoformat()).limit(1).execute()
+        
+        if not response.data:
+            new_theme = generate_daily_theme()
+            end_date = today_start + timedelta(days=1)
+            insert_res = supabase.table('ai_contests').insert({
+                "theme_prompt": new_theme, "start_date": today_start.isoformat(),
+                "end_date": end_date.isoformat(), "status": "active", "prize_pool": 10000
+            }).execute()
+            return insert_res.data[0]
+        return response.data[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Impossibile recuperare il contest.")
+
+@app.post("/contests/generate_image")
+async def generate_ai_image(req: ImageGenerationRequest):
+    try:
+        user_response = supabase.table('users').select('points_balance').eq('user_id', req.user_id).single().execute()
+        if not user_response.data or user_response.data.get('points_balance', 0) < IMAGE_GENERATION_COST:
+            raise HTTPException(status_code=402, detail="Zenith Coins insufficienti.")
+
+        new_balance = user_response.data.get('points_balance', 0) - IMAGE_GENERATION_COST
+        supabase.table('users').update({'points_balance': new_balance}).eq('user_id', req.user_id).execute()
+
+        model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-002")
+        full_prompt = f"Digital art masterpiece, award-winning, highly detailed, cinematic lighting. Theme: {req.prompt}"
+        images = model.generate_images(prompt=full_prompt, number_of_images=1, aspect_ratio="1:1")
+        
+        image_bytes = images[0]._image_bytes
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        image_data_url = f"data:image/png;base64,{base64_image}"
+        
+        return {"image_url": image_data_url, "new_balance": new_balance}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Errore durante la generazione dell'immagine.")
+
+@app.post("/contests/submit")
+def submit_artwork(req: SubmissionRequest):
+    try:
+        supabase.table('ai_submissions').insert({
+            "contest_id": req.contest_id, "user_id": req.user_id,
+            "image_url": req.image_url, "prompt": req.prompt, "votes": 0
+        }).execute()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Errore nell'invio dell'opera.")
+
+# --- Altri Endpoint (Gamification, Postback, etc.) ---
 @app.get("/leaderboard")
 def get_leaderboard():
     try:
         response = supabase.table('users').select('display_name, points_balance, avatar_url').order('points_balance', desc=True).limit(5).execute()
-        leaderboard_data = [{"name": u.get('display_name', 'Utente Anonimo'), "earnings": u.get('points_balance', 0)/POINTS_TO_EUR_RATE, "avatar": u.get('avatar_url', '')} for u in response.data]
+        leaderboard_data = [{"name": u.get('display_name', 'N/A'), "earnings": u.get('points_balance', 0)/POINTS_TO_EUR_RATE, "avatar": u.get('avatar_url', '')} for u in response.data]
         return leaderboard_data
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Errore nel caricare la classifica.")
-
-@app.get("/community_goal")
-def get_community_goal():
-    try:
-        response = supabase.table('users').select('points_balance').execute()
-        total_balance = sum(u.get('points_balance', 0) for u in response.data)
-        return {"current": total_balance, "target": mock_community_goal['target'], "reward": mock_community_goal['reward']}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Errore nel caricare l'obiettivo community.")
-
-@app.get("/streak/status/{user_id}")
-def get_streak_status(user_id: str):
-    try:
-        response = supabase.table('users').select('login_streak').eq('user_id', user_id).single().execute()
-        if not response.data:
-            return {"days": 0, "canClaim": False}
-        return {"days": response.data.get('login_streak', 0), "canClaim": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Errore nel recuperare lo streak.")
-
-@app.get("/missions/{user_id}")
-def get_user_missions(user_id: str):
-    missions = random.sample(possible_missions, 3)
-    for mission in missions:
-        mission['progress'] = round(random.uniform(0, mission['target']), 1)
-    return missions
+        raise HTTPException(status_code=500, detail=str(e))
