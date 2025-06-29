@@ -34,7 +34,7 @@ if not all([SUPABASE_URL, SUPABASE_KEY, GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_J
     raise ValueError("Errore: mancano le variabili d'ambiente di Supabase o Google Cloud.")
 
 try:
-    # Inizializza il client Vertex AI
+    gcp_credentials_info = json.loads(GCP_SA_KEY_JSON_STR)
     vertexai.init(project=GCP_PROJECT_ID, location=GCP_REGION)
 except Exception as e:
     print(f"ATTENZIONE: Errore nella configurazione delle credenziali Google Cloud: {e}")
@@ -60,6 +60,9 @@ class UserSyncRequest(BaseModel):
     user_id: str; email: str | None; displayName: str | None = None
     referrer_id: str | None = None; avatar_url: str | None = None
 
+class ProfileUpdateRequest(BaseModel):
+    display_name: str; avatar_url: str
+
 class PayoutRequest(BaseModel):
     user_id: str; points_amount: int; method: str; address: str
 
@@ -68,10 +71,6 @@ class ImageGenerationRequest(BaseModel):
 
 class SubmissionRequest(BaseModel):
     contest_id: int; user_id: str; image_url: str; prompt: str
-
-class VoteRequest(BaseModel):
-    submission_id: int; user_id: str
-
 
 # --- Endpoint di Base ---
 @app.get("/")
@@ -105,7 +104,9 @@ def sync_user(user_data: UserSyncRequest):
                     streak = 1
             else:
                 streak = 1
+            
             supabase.table('users').update({'last_login_at': now.isoformat(), 'login_streak': streak}).eq('user_id', user_data.user_id).execute()
+            
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -120,7 +121,24 @@ def get_user_balance(user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore nel recupero del saldo.")
 
-# --- Sistema di Prelievi ---
+# --- Sistema di Prelievi con PayPal API ---
+def process_paypal_payout(payout_id: int, user_email: str, value_eur: float):
+    try:
+        auth_response = requests.post(f"{PAYPAL_API_BASE_URL}/v1/oauth2/token", auth=(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET), headers={"Accept": "application/json", "Accept-Language": "en_US"}, data={"grant_type": "client_credentials"})
+        auth_response.raise_for_status()
+        access_token = auth_response.json()["access_token"]
+        payout_data = {
+            "sender_batch_header": {"sender_batch_id": f"Zenith_{payout_id}_{int(datetime.now().timestamp())}", "email_subject": "Hai ricevuto un pagamento da Zenith Rewards!", "email_message": f"Grazie per aver usato la nostra piattaforma! Ecco il tuo premio di {value_eur:.2f} EUR."},
+            "items": [{"recipient_type": "EMAIL", "amount": {"value": f"{value_eur:.2f}", "currency": "EUR"}, "receiver": user_email}]
+        }
+        payout_response = requests.post(f"{PAYPAL_API_BASE_URL}/v1/payments/payouts", headers={"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"}, json=payout_data)
+        payout_response.raise_for_status()
+        supabase.table('payout_requests').update({'status': 'completed'}).eq('id', payout_id).execute()
+        return True, payout_response.json()
+    except Exception as e:
+        supabase.table('payout_requests').update({'status': 'failed'}).eq('id', payout_id).execute()
+        return False, str(e)
+
 @app.post("/request_payout")
 def request_payout(payout_data: PayoutRequest):
     try:
@@ -132,14 +150,17 @@ def request_payout(payout_data: PayoutRequest):
         supabase.table('users').update({'points_balance': new_balance}).eq('user_id', payout_data.user_id).execute()
         
         value_in_eur = payout_data.points_amount / POINTS_TO_EUR_RATE
-        supabase.table('payout_requests').insert({
+        insert_res = supabase.table('payout_requests').insert({
             'user_id': payout_data.user_id, 'points_amount': payout_data.points_amount,
-            'value_in_eur': value_in_eur, 'payout_method': payout_data.method, 
-            'wallet_address': payout_data.address, 'status': 'pending'
+            'value_in_eur': value_in_eur, 'payout_method': payout_data.method,
+            'wallet_address': payout_data.address, 'status': 'processing'
         }).execute()
+
+        if payout_data.method == 'paypal' and PAYPAL_CLIENT_ID:
+            payout_id = insert_res.data[0]['id']
+            process_paypal_payout(payout_id, payout_data.address, value_in_eur)
+            
         return {"status": "success", "message": "Richiesta di prelievo inviata."}
-    except HTTPException as http_exc:
-        raise http_exc
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore nell'elaborazione della richiesta.")
 
@@ -151,7 +172,6 @@ def generate_daily_theme():
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
-        print(f"Errore generazione tema: {e}")
         return "Un drago fatto di cristalli"
 
 @app.get("/contests/current")
