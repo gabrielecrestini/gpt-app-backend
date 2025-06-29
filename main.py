@@ -1,4 +1,4 @@
-# main.py - Versione Finale Definitiva (con IA Reale e fix)
+# main.py - Versione Finale Definitiva (con IA Reale)
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -23,7 +23,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
 PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
-PAYPAL_API_BASE_URL = "https://api-m.paypal.com"
+PAYPAL_API_BASE_URL = "https://api-m.paypal.com"  # O "https://api-m.sandbox.paypal.com" per test
 
 # Configurazione Google Cloud AI
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
@@ -31,10 +31,10 @@ GCP_REGION = os.environ.get("GCP_REGION")
 GCP_SA_KEY_JSON_STR = os.environ.get("GCP_SA_KEY_JSON")
 
 if not all([SUPABASE_URL, SUPABASE_KEY, GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
-    print("ATTENZIONE: Mancano una o più variabili d'ambiente essenziali (Supabase o Google Cloud).")
+    raise ValueError("Errore: mancano le variabili d'ambiente di Supabase o Google Cloud.")
 
 try:
-    gcp_credentials_info = json.loads(GCP_SA_KEY_JSON_STR)
+    # Inizializza il client Vertex AI
     vertexai.init(project=GCP_PROJECT_ID, location=GCP_REGION)
 except Exception as e:
     print(f"ATTENZIONE: Errore nella configurazione delle credenziali Google Cloud: {e}")
@@ -69,6 +69,10 @@ class ImageGenerationRequest(BaseModel):
 class SubmissionRequest(BaseModel):
     contest_id: int; user_id: str; image_url: str; prompt: str
 
+class VoteRequest(BaseModel):
+    submission_id: int; user_id: str
+
+
 # --- Endpoint di Base ---
 @app.get("/")
 def read_root():
@@ -101,12 +105,9 @@ def sync_user(user_data: UserSyncRequest):
                     streak = 1
             else:
                 streak = 1
-            
             supabase.table('users').update({'last_login_at': now.isoformat(), 'login_streak': streak}).eq('user_id', user_data.user_id).execute()
-            
         return {"status": "success"}
     except Exception as e:
-        print(f"Errore in sync_user: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get_user_balance/{user_id}")
@@ -119,7 +120,7 @@ def get_user_balance(user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore nel recupero del saldo.")
 
-# --- Sistema di Prelievi Reale ---
+# --- Sistema di Prelievi ---
 @app.post("/request_payout")
 def request_payout(payout_data: PayoutRequest):
     try:
@@ -137,6 +138,8 @@ def request_payout(payout_data: PayoutRequest):
             'wallet_address': payout_data.address, 'status': 'pending'
         }).execute()
         return {"status": "success", "message": "Richiesta di prelievo inviata."}
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore nell'elaborazione della richiesta.")
 
@@ -144,7 +147,7 @@ def request_payout(payout_data: PayoutRequest):
 def generate_daily_theme():
     try:
         model = GenerativeModel("gemini-1.0-pro")
-        prompt = "Genera un tema artistico breve, creativo e stimolante (massimo 10 parole) per una competizione di arte digitale. Fornisci solo il testo del tema, senza virgolette o prefissi."
+        prompt = "Genera un tema artistico breve, creativo e stimolante per una competizione di arte digitale. Fornisci solo il testo del tema, senza virgolette o prefissi."
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
@@ -156,12 +159,11 @@ def get_current_contest():
     try:
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         response = supabase.table('ai_contests').select('*').gte('created_at', today_start.isoformat()).limit(1).execute()
-        
         if not response.data:
             new_theme = generate_daily_theme()
             end_date = today_start + timedelta(days=1)
             insert_res = supabase.table('ai_contests').insert({
-                "theme_prompt": new_theme, "start_date": today_start.isoformat(),
+                "theme_prompt": new_theme, "start_date": start_date.isoformat(),
                 "end_date": end_date.isoformat(), "status": "active", "prize_pool": 10000
             }).execute()
             return insert_res.data[0]
@@ -209,5 +211,13 @@ def get_leaderboard():
         response = supabase.table('users').select('display_name, points_balance, avatar_url').order('points_balance', desc=True).limit(5).execute()
         leaderboard_data = [{"name": u.get('display_name', 'N/A'), "earnings": u.get('points_balance', 0)/POINTS_TO_EUR_RATE, "avatar": u.get('avatar_url', '')} for u in response.data]
         return leaderboard_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/referral_stats/{user_id}")
+def get_referral_stats(user_id: str):
+    try:
+        response = supabase.table('users').select('user_id', count='exact').eq('referrer_id', user_id).execute()
+        return {"referral_count": response.count or 0, "referral_earnings": 0.00}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
