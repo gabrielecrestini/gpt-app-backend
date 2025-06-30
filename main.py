@@ -1,11 +1,11 @@
-# main.py - Versione Finale e Completa con Funzionalità Social
+# main.py - Versione Finale e Completa
+# Data: 30 Giugno 2025
 
 # --- Import delle librerie ---
 import os
 import json
 import base64
 from datetime import datetime, timezone, timedelta
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -40,9 +40,11 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Inizializza Vertex AI (solo se le credenziali sono presenti)
 if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
     try:
+        # GCP ha bisogno delle credenziali in un file, quindi le scriviamo temporaneamente
         with open("gcp_sa_key.json", "w") as f:
             f.write(GCP_SA_KEY_JSON_STR)
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "gcp_sa_key.json"
+        
         vertexai.init(project=GCP_PROJECT_ID, location=GCP_REGION)
         print("Vertex AI inizializzato correttamente.")
     except Exception as e:
@@ -50,7 +52,7 @@ if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
 else:
     print("ATTENZIONE: Credenziali Google Cloud non trovate. Le funzionalità AI saranno disabilitate.")
 
-# Configurazione CORS
+# Configurazione CORS per permettere al frontend di comunicare con il backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "https://cashhh-52f38.web.app"],
@@ -97,6 +99,7 @@ def read_root():
 def sync_user(user_data: UserSyncRequest):
     try:
         response = supabase.table('users').select('*').eq('user_id', user_data.user_id).maybe_single().execute()
+
         if not response.data:
             new_user_record = {
                 'user_id': user_data.user_id, 'email': user_data.email,
@@ -124,13 +127,10 @@ def get_user_balance(user_id: str):
 
 @app.post("/request_payout")
 def request_payout(payout_data: PayoutRequest):
-    # Logica di prelievo... (da implementare)
-    return {"status": "success", "message": "Richiesta di prelievo inviata."}
-
+    return {"status": "success", "message": "Richiesta di prelievo inviata (funzionalità da implementare)."}
 
 @app.get("/contests/current")
 def get_current_contest():
-    # Logica per recuperare il contest del giorno... (da implementare)
     return {"id": 1, "theme_prompt": "Un robot che dipinge un tramonto, stile Van Gogh", "end_date": "2025-07-01T23:59:59Z"}
 
 @app.post("/contests/generate_image")
@@ -150,12 +150,11 @@ def generate_ai_image(req: ImageGenerationRequest):
         raise http_exc
     except Exception as e:
         print(f"Errore imprevisto in generate_image: {e}")
-        raise HTTPException(status_code=500, detail="Errore interno del server.")
+        raise HTTPException(status_code=500, detail="Errore interno del server durante la generazione dell'immagine.")
 
 @app.post("/contests/submit")
 def submit_artwork(req: SubmissionRequest):
-    # Logica di invio opera d'arte... (da implementare)
-    return {"status": "success"}
+    return {"status": "success", "message": "Opera inviata (funzionalità da implementare)."}
 
 @app.get("/contests/{contest_id}/submissions")
 def get_contest_submissions(contest_id: int):
@@ -169,6 +168,7 @@ def get_contest_submissions(contest_id: int):
 @app.post("/submissions/{submission_id}/vote")
 def vote_for_submission(submission_id: int):
     try:
+        # Assicurati di aver creato la funzione 'increment_votes' in Supabase!
         supabase.rpc('increment_votes', {'submission_id_in': submission_id}).execute()
         return {"status": "success"}
     except Exception as e:
@@ -179,8 +179,17 @@ def vote_for_submission(submission_id: int):
 def get_leaderboard():
     try:
         response = supabase.table('users').select('display_name, points_balance, avatar_url').order('points_balance', desc=True).limit(10).execute()
-        return response.data
+        leaderboard_data = []
+        for u in response.data:
+            leaderboard_data.append({
+                "name": u.get('display_name', 'N/A'),
+                "points_balance": u.get('points_balance', 0),
+                "avatar": u.get('avatar_url', ''),
+                "earnings": u.get('points_balance', 0) / POINTS_TO_EUR_RATE
+            })
+        return leaderboard_data
     except Exception as e:
+        print(f"Errore nel caricamento della classifica: {e}")
         raise HTTPException(status_code=500, detail="Errore nel caricamento della classifica.")
 
 @app.get("/referral_stats/{user_id}")
