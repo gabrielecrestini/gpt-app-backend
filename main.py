@@ -280,17 +280,12 @@ def get_missions(user_id: str):
 def update_profile(user_id: str, profile_data: UserProfileUpdate):
     try:
         supabase = get_supabase_client()
-        
         update_payload = profile_data.dict(exclude_unset=True)
-
         if not update_payload:
             raise HTTPException(status_code=400, detail="Nessun dato fornito per l'aggiornamento.")
-
         response = supabase.table('users').update(update_payload).eq('user_id', user_id).execute(returning="representation")
-        
         if not response.data:
             raise HTTPException(status_code=404, detail="Utente non trovato o nessun dato è stato modificato.")
-        
         return {"status": "success", "message": "Profilo aggiornato con successo.", "data": response.data[0]}
     except Exception as e:
         print(f"Errore in update_profile: {e}")
