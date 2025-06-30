@@ -24,7 +24,7 @@ load_dotenv()
 
 # Caricamento delle variabili d'ambiente
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY") 
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 GCP_REGION = os.environ.get("GCP_REGION")
 GCP_SA_KEY_JSON_STR = os.environ.get("GCP_SA_KEY_JSON")
@@ -80,6 +80,10 @@ class SubmissionRequest(BaseModel):
 class PurchaseRequest(BaseModel):
     user_id: str
     item_id: int
+
+class UserProfileUpdate(BaseModel):
+    displayName: str | None = None
+    avatar_url: str | None = None
 
 # --- Funzione Helper per il Client Supabase ---
 def get_supabase_client() -> Client:
@@ -137,76 +141,9 @@ def get_user_balance(user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/streak/status/{user_id}")
-def get_streak_status(user_id: str):
-    try:
-        supabase = get_supabase_client()
-        response = supabase.table('users').select('login_streak, last_streak_claim_at').eq('user_id', user_id).maybe_single().execute()
-        if not response or not response.data:
-            return {"days": 0, "canClaim": False}
-        user = response.data
-        can_claim = True
-        if user.get('last_streak_claim_at'):
-            last_claim_date = datetime.fromisoformat(user.get('last_streak_claim_at')).date()
-            if last_claim_date == datetime.now(timezone.utc).date():
-                can_claim = False
-        return {"days": user.get('login_streak', 0), "canClaim": can_claim}
-    except Exception as e:
-        print(f"Errore in get_streak_status: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/streak/claim/{user_id}")
-def claim_streak_bonus(user_id: str):
-    try:
-        status_response = get_streak_status(user_id=user_id)
-        if not status_response.get("canClaim"):
-            raise HTTPException(status_code=400, detail="Bonus giornaliero già riscosso.")
-        
-        reward = min(status_response.get("days", 0) * 10, 100)
-        
-        supabase = get_supabase_client()
-        user_res = supabase.table('users').select('points_balance').eq('user_id', user_id).single().execute()
-        new_balance = user_res.data.get('points_balance', 0) + reward
-        
-        supabase.table('users').update({'points_balance': new_balance, 'last_streak_claim_at': datetime.now(timezone.utc).isoformat()}).eq('user_id', user_id).execute()
-        
-        return {"status": "success", "message": f"Hai riscattato {reward} Zenith Coins!", "new_balance": new_balance}
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        print(f"Errore in claim_streak_bonus: {e}")
-        raise HTTPException(status_code=500, detail="Errore durante la riscossione del bonus.")
-
-@app.get("/leaderboard")
-def get_leaderboard():
-    try:
-        supabase = get_supabase_client()
-        response = supabase.table('users').select('display_name, points_balance, avatar_url').order('points_balance', desc=True).limit(10).execute()
-        leaderboard_data = [{"name": u.get('display_name', 'N/A'), "points_balance": u.get('points_balance', 0), "avatar": u.get('avatar_url', ''), "earnings": u.get('points_balance', 0) / POINTS_TO_EUR_RATE} for u in response.data]
-        return leaderboard_data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Errore nel caricamento della classifica.")
-
-@app.get("/shop/items")
-def get_shop_items():
-    try:
-        supabase = get_supabase_client()
-        response = supabase.table("shop_items").select("*").eq("is_active", True).order("price").execute()
-        return response.data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Impossibile caricare gli oggetti del negozio.")
-
-@app.post("/shop/buy")
-def buy_shop_item(req: PurchaseRequest):
-    try:
-        supabase = get_supabase_client()
-        supabase.rpc('purchase_item', {'p_user_id': req.user_id, 'p_item_id': req.item_id}).execute()
-        return {"status": "success", "message": "Acquisto completato!"}
-    except Exception as e:
-        if 'Fondi insufficienti' in str(e):
-            raise HTTPException(status_code=402, detail="Zenith Coins insufficienti per questo acquisto.")
-        print(f"Errore durante l'acquisto: {e}")
-        raise HTTPException(status_code=500, detail="Si è verificato un errore durante l'acquisto.")
+@app.post("/request_payout")
+def request_payout(payout_data: PayoutRequest):
+    raise HTTPException(status_code=501, detail="Funzionalità di prelievo non ancora implementata.")
 
 @app.get("/contests/current")
 def get_current_contest():
@@ -255,6 +192,16 @@ def vote_for_submission(submission_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore durante la votazione.")
 
+@app.get("/leaderboard")
+def get_leaderboard():
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table('users').select('display_name, points_balance, avatar_url').order('points_balance', desc=True).limit(10).execute()
+        leaderboard_data = [{"name": u.get('display_name', 'N/A'), "points_balance": u.get('points_balance', 0), "avatar": u.get('avatar_url', ''), "earnings": u.get('points_balance', 0) / POINTS_TO_EUR_RATE} for u in response.data]
+        return leaderboard_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Errore nel caricamento della classifica.")
+
 @app.get("/referral_stats/{user_id}")
 def get_referral_stats(user_id: str):
     try:
@@ -264,10 +211,76 @@ def get_referral_stats(user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore nel recupero delle statistiche referral.")
 
+@app.get("/streak/status/{user_id}")
+def get_streak_status(user_id: str):
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table('users').select('login_streak, last_streak_claim_at').eq('user_id', user_id).maybe_single().execute()
+        if not response or not response.data:
+            return {"days": 0, "canClaim": False}
+        user = response.data
+        can_claim = True
+        if user.get('last_streak_claim_at'):
+            last_claim_date = datetime.fromisoformat(user.get('last_streak_claim_at')).date()
+            if last_claim_date == datetime.now(timezone.utc).date():
+                can_claim = False
+        return {"days": user.get('login_streak', 0), "canClaim": can_claim}
+    except Exception as e:
+        print(f"Errore in get_streak_status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/streak/claim/{user_id}")
+def claim_streak_bonus(user_id: str):
+    try:
+        status_response = get_streak_status(user_id=user_id)
+        if not status_response.get("canClaim"):
+            raise HTTPException(status_code=400, detail="Bonus giornaliero già riscosso.")
+        reward = min(status_response.get("days", 0) * 10, 100)
+        supabase = get_supabase_client()
+        user_res = supabase.table('users').select('points_balance').eq('user_id', user_id).single().execute()
+        new_balance = user_res.data.get('points_balance', 0) + reward
+        supabase.table('users').update({'points_balance': new_balance, 'last_streak_claim_at': datetime.now(timezone.utc).isoformat()}).eq('user_id', user_id).execute()
+        return {"status": "success", "message": f"Hai riscattato {reward} Zenith Coins!", "new_balance": new_balance}
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        print(f"Errore in claim_streak_bonus: {e}")
+        raise HTTPException(status_code=500, detail="Errore durante la riscossione del bonus.")
+
 @app.get("/missions/{user_id}")
 def get_missions(user_id: str):
     raise HTTPException(status_code=501, detail="Funzionalità missioni non ancora implementata.")
 
+# --- ENDPOINT AGGIORNATO ---
 @app.post("/update_profile/{user_id}")
-def update_profile(user_id: str):
-    raise HTTPException(status_code=501, detail="Funzionalità di aggiornamento profilo non ancora implementata.")
+def update_profile(user_id: str, profile_data: UserProfileUpdate):
+    """
+    Aggiorna il profilo di un utente, come il nome visualizzato o l'avatar scelto.
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        update_payload = {}
+        # Costruiamo dinamicamente il payload per aggiornare solo i campi forniti
+        if profile_data.displayName is not None:
+            update_payload['display_name'] = profile_data.displayName
+        if profile_data.avatar_url is not None:
+            update_payload['avatar_url'] = profile_data.avatar_url
+
+        if not update_payload:
+            raise HTTPException(status_code=400, detail="Nessun dato fornito per l'aggiornamento.")
+
+        response = supabase.table('users').update(update_payload).eq('user_id', user_id).execute()
+        
+        # La chiamata 'update' restituisce dati solo se specificato, quindi controlliamo se ha avuto effetto
+        if not response.data:
+            # Potrebbe essere che l'utente non esista, o che i dati fossero identici
+            # Verifichiamo se l'utente esiste per dare un errore più specifico
+            check_user = supabase.table('users').select('user_id').eq('user_id', user_id).maybe_single().execute()
+            if not check_user.data:
+                raise HTTPException(status_code=404, detail="Utente non trovato.")
+        
+        return {"status": "success", "message": "Profilo aggiornato con successo."}
+    except Exception as e:
+        print(f"Errore in update_profile: {e}")
+        raise HTTPException(status_code=500, detail="Errore durante l'aggiornamento del profilo.")
