@@ -1,4 +1,4 @@
-# main.py - Versione Finale Definitiva - Connessioni Robuste per ogni richiesta
+# main.py - Versione Finale Definitiva - Connessioni Robuste e Query Semplificate
 # Data: 30 Giugno 2025
 
 # --- Import delle librerie ---
@@ -7,6 +7,7 @@ import json
 import base64
 import time
 from datetime import datetime, timezone, timedelta
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -31,7 +32,6 @@ GCP_SA_KEY_JSON_STR = os.environ.get("GCP_SA_KEY_JSON")
 # --- Inizializzazione dei Servizi ---
 app = FastAPI(title="Zenith Rewards Backend", description="API per la gestione dell'app Zenith Rewards.")
 
-# La configurazione di Vertex AI può rimanere globale
 if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
     try:
         with open("gcp_sa_key.json", "w") as f: f.write(GCP_SA_KEY_JSON_STR)
@@ -41,7 +41,6 @@ if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
     except Exception as e:
         print(f"ATTENZIONE: Errore nella configurazione di Vertex AI: {e}")
 
-# Configurazione CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "https://cashhh-52f38.web.app"],
@@ -81,9 +80,11 @@ class SubmissionRequest(BaseModel):
 # --- Funzione Helper per il Client Supabase ---
 def get_supabase_client() -> Client:
     """Crea e restituisce un client Supabase nuovo e pulito per ogni richiesta."""
-    if not all([SUPABASE_URL, SUPABASE_KEY]):
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+    if not all([url, key]):
         raise ValueError("Variabili d'ambiente di Supabase non impostate.")
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+    return create_client(url, key)
 
 # --- Endpoint dell'API ---
 
@@ -95,22 +96,28 @@ def read_root():
 def sync_user(user_data: UserSyncRequest):
     try:
         supabase = get_supabase_client()
-        response = supabase.table('users').select('last_login_at, login_streak').eq('user_id', user_data.user_id).maybe_single().execute()
+        response = supabase.table('users').select('last_login_at, login_streak').eq('user_id', user_data.user_id).execute()
+        
+        if not response:
+            raise Exception("CRITICO: La risposta dal database era nulla (None) anche con una query semplificata.")
+        
         now = datetime.now(timezone.utc)
         
-        if not response.data:
+        if not response.data or len(response.data) == 0:
             new_user_record = {'user_id': user_data.user_id, 'email': user_data.email, 'display_name': user_data.displayName, 'referrer_id': user_data.referrer_id, 'avatar_url': user_data.avatar_url, 'login_streak': 1, 'last_login_at': now.isoformat(), 'points_balance': 0}
             supabase.table('users').insert(new_user_record).execute()
         else:
-            user, last_login_str, new_streak = response.data, response.data.get('last_login_at'), response.data.get('login_streak', 1)
+            user = response.data[0]
+            last_login_str, new_streak = user.get('last_login_at'), user.get('login_streak', 1)
             if last_login_str:
                 days_diff = (now.date() - datetime.fromisoformat(last_login_str).date()).days
                 if days_diff == 1: new_streak += 1
                 elif days_diff > 1: new_streak = 1
             supabase.table('users').update({'last_login_at': now.isoformat(), 'login_streak': new_streak}).eq('user_id', user_data.user_id).execute()
+        
         return {"status": "success"}
     except Exception as e:
-        print(f"Errore in sync_user: {e}")
+        print(f"Errore finale in sync_user: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get_user_balance/{user_id}")
@@ -132,7 +139,6 @@ def request_payout(payout_data: PayoutRequest):
 
 @app.get("/contests/current")
 def get_current_contest():
-    # Questa è una versione segnaposto, puoi aggiungere la logica per caricarlo dal DB
     return {"id": 1, "theme_prompt": "Un robot che dipinge un tramonto, stile Van Gogh"}
 
 @app.post("/contests/generate_image")
@@ -141,7 +147,7 @@ def generate_ai_image(req: ImageGenerationRequest):
         supabase = get_supabase_client()
         user_response = supabase.table('users').select('points_balance').eq('user_id', req.user_id).maybe_single().execute()
         if not user_response or not user_response.data:
-            raise HTTPException(status_code=404, detail="Utente non trovato.")
+            raise HTTPException(status_code=404, detail="Utente non trovato per la generazione dell'immagine.")
         if user_response.data.get('points_balance', 0) < IMAGE_GENERATION_COST:
             raise HTTPException(status_code=402, detail="Zenith Coins insufficienti.")
         new_balance = user_response.data.get('points_balance', 0) - IMAGE_GENERATION_COST
@@ -173,7 +179,6 @@ def get_contest_submissions(contest_id: int):
 def vote_for_submission(submission_id: int):
     try:
         supabase = get_supabase_client()
-        # Assicurati di aver creato la funzione 'increment_votes' in Supabase!
         supabase.rpc('increment_votes', {'submission_id_in': submission_id}).execute()
         return {"status": "success"}
     except Exception as e:
@@ -219,7 +224,6 @@ def get_streak_status(user_id: str):
 @app.post("/streak/claim/{user_id}")
 def claim_streak_bonus(user_id: str):
     try:
-        # La chiamata interna a get_streak_status usa la sua propria connessione
         status_response = get_streak_status(user_id=user_id)
         if not status_response.get("canClaim"):
             raise HTTPException(status_code=400, detail="Bonus giornaliero già riscosso.")
