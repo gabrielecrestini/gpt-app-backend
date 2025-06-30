@@ -1,5 +1,4 @@
-# main.py - Versione Finale e Completa
-# Data: 30 Giugno 2025
+# main.py - Versione Finale e Completa con Funzionalità Social
 
 # --- Import delle librerie ---
 import os
@@ -41,12 +40,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Inizializza Vertex AI (solo se le credenziali sono presenti)
 if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
     try:
-        # GCP ha bisogno delle credenziali in un file, quindi le scriviamo temporaneamente
-        # Questo approccio è comune in ambienti come Render
         with open("gcp_sa_key.json", "w") as f:
             f.write(GCP_SA_KEY_JSON_STR)
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "gcp_sa_key.json"
-        
         vertexai.init(project=GCP_PROJECT_ID, location=GCP_REGION)
         print("Vertex AI inizializzato correttamente.")
     except Exception as e:
@@ -54,7 +50,7 @@ if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
 else:
     print("ATTENZIONE: Credenziali Google Cloud non trovate. Le funzionalità AI saranno disabilitate.")
 
-# Configurazione CORS per permettere al frontend di comunicare con il backend
+# Configurazione CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "https://cashhh-52f38.web.app"],
@@ -64,7 +60,6 @@ app.add_middleware(
 )
 
 # --- Costanti e Modelli Dati (Pydantic) ---
-
 IMAGE_GENERATION_COST = 50
 POINTS_TO_EUR_RATE = 1000.0
 
@@ -98,15 +93,10 @@ class SubmissionRequest(BaseModel):
 def read_root():
     return {"message": "Zenith Rewards Backend API. Tutti i sistemi sono attivi."}
 
-# --- Gestione Utenti ---
-
 @app.post("/sync_user")
 def sync_user(user_data: UserSyncRequest):
     try:
-        # Usiamo maybe_single() per gestire elegantemente il caso in cui l'utente non esista
         response = supabase.table('users').select('*').eq('user_id', user_data.user_id).maybe_single().execute()
-
-        # Se l'utente non esiste, lo creiamo (INSERT)
         if not response.data:
             new_user_record = {
                 'user_id': user_data.user_id, 'email': user_data.email,
@@ -115,17 +105,14 @@ def sync_user(user_data: UserSyncRequest):
                 'last_login_at': datetime.now(timezone.utc).isoformat(), 'points_balance': 0
             }
             supabase.table('users').insert(new_user_record).execute()
-        # Se l'utente esiste già, aggiorniamo i suoi dati di accesso (UPDATE)
         else:
-            # Qui puoi inserire la logica per aggiornare la login_streak
             supabase.table('users').update({
                 'last_login_at': datetime.now(timezone.utc).isoformat()
             }).eq('user_id', user_data.user_id).execute()
-
-        return {"status": "success", "message": "Utente sincronizzato correttamente."}
+        return {"status": "success", "message": "Utente sincronizzato."}
     except Exception as e:
-        print(f"Errore critico in sync_user: {e}")
-        raise HTTPException(status_code=500, detail=f"Errore interno del server durante la sincronizzazione: {e}")
+        print(f"Errore in sync_user: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get_user_balance/{user_id}")
 def get_user_balance(user_id: str):
@@ -133,18 +120,13 @@ def get_user_balance(user_id: str):
         response = supabase.table('users').select('points_balance').eq('user_id', user_id).single().execute()
         return {"points_balance": response.data.get('points_balance', 0)}
     except Exception as e:
-        print(f"Errore in get_user_balance: {e}")
-        raise HTTPException(status_code=404, detail="Utente non trovato o errore nel recupero del saldo.")
-
-# --- Sistema di Prelievi ---
+        raise HTTPException(status_code=404, detail="Utente non trovato.")
 
 @app.post("/request_payout")
 def request_payout(payout_data: PayoutRequest):
     # Logica di prelievo... (da implementare)
     return {"status": "success", "message": "Richiesta di prelievo inviata."}
 
-
-# --- Sistema "Zenith Art Battles" con IA Reale ---
 
 @app.get("/contests/current")
 def get_current_contest():
@@ -155,34 +137,43 @@ def get_current_contest():
 def generate_ai_image(req: ImageGenerationRequest):
     try:
         user_response = supabase.table('users').select('points_balance').eq('user_id', req.user_id).single().execute()
-
         if user_response.data.get('points_balance', 0) < IMAGE_GENERATION_COST:
-            raise HTTPException(status_code=402, detail="Zenith Coins insufficienti per generare l'immagine.")
-
+            raise HTTPException(status_code=402, detail="Zenith Coins insufficienti.")
         new_balance = user_response.data.get('points_balance', 0) - IMAGE_GENERATION_COST
         supabase.table('users').update({'points_balance': new_balance}).eq('user_id', req.user_id).execute()
-
         model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-002")
         images = model.generate_images(prompt=req.prompt, number_of_images=1, aspect_ratio="1:1")
-        
         image_bytes = images[0]._image_bytes
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
-        
         return {"image_url": f"data:image/png;base64,{base64_image}", "new_balance": new_balance}
     except HTTPException as http_exc:
-        # Lascia passare le eccezioni HTTP che abbiamo generato noi (es. 402)
         raise http_exc
     except Exception as e:
-        # Cattura tutti gli altri errori imprevisti (es. da Vertex AI)
         print(f"Errore imprevisto in generate_image: {e}")
-        raise HTTPException(status_code=500, detail=f"Errore interno del server durante la generazione dell'immagine: {e}")
+        raise HTTPException(status_code=500, detail="Errore interno del server.")
 
 @app.post("/contests/submit")
 def submit_artwork(req: SubmissionRequest):
     # Logica di invio opera d'arte... (da implementare)
     return {"status": "success"}
 
-# --- Endpoint di Gamification ---
+@app.get("/contests/{contest_id}/submissions")
+def get_contest_submissions(contest_id: int):
+    try:
+        response = supabase.table("ai_submissions").select("*, user:users(display_name, avatar_url)").eq("contest_id", contest_id).order("votes", desc=True).execute()
+        return response.data
+    except Exception as e:
+        print(f"Errore recupero submissions: {e}")
+        raise HTTPException(status_code=500, detail="Impossibile caricare le opere della community.")
+
+@app.post("/submissions/{submission_id}/vote")
+def vote_for_submission(submission_id: int):
+    try:
+        supabase.rpc('increment_votes', {'submission_id_in': submission_id}).execute()
+        return {"status": "success"}
+    except Exception as e:
+        print(f"Errore nel voto: {e}")
+        raise HTTPException(status_code=500, detail="Errore durante la votazione.")
 
 @app.get("/leaderboard")
 def get_leaderboard():
@@ -200,21 +191,14 @@ def get_referral_stats(user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Errore nel recupero delle statistiche referral.")
 
-# --- Endpoint Segnaposto (per risolvere i 404 Not Found) ---
-# Questi endpoint sono richiesti dal tuo frontend. Per ora restituiscono un messaggio
-# che indica che la funzionalità non è ancora implementata.
-
 @app.get("/streak/status/{user_id}")
 def get_streak_status(user_id: str):
-    # Logica futura per la streak di login
     raise HTTPException(status_code=501, detail="Funzionalità streak non ancora implementata.")
 
 @app.get("/missions/{user_id}")
 def get_missions(user_id: str):
-    # Logica futura per le missioni utente
     raise HTTPException(status_code=501, detail="Funzionalità missioni non ancora implementata.")
 
 @app.post("/update_profile/{user_id}")
 def update_profile(user_id: str):
-    # Logica futura per l'aggiornamento del profilo
     raise HTTPException(status_code=501, detail="Funzionalità di aggiornamento profilo non ancora implementata.")
