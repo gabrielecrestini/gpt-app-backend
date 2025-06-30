@@ -1,4 +1,4 @@
-# main.py - Versione Finale Definitiva - Connessioni Robuste e Tutte le Funzionalità
+# main.py - Versione Finale, Stabile e Completa
 # Data: 30 Giugno 2025
 
 # --- Import delle librerie ---
@@ -280,19 +280,18 @@ def get_missions(user_id: str):
 def update_profile(user_id: str, profile_data: UserProfileUpdate):
     try:
         supabase = get_supabase_client()
-        update_payload = {}
-        if profile_data.displayName is not None:
-            update_payload['display_name'] = profile_data.displayName
-        if profile_data.avatar_url is not None:
-            update_payload['avatar_url'] = profile_data.avatar_url
+        
+        update_payload = profile_data.dict(exclude_unset=True)
+
         if not update_payload:
             raise HTTPException(status_code=400, detail="Nessun dato fornito per l'aggiornamento.")
-        response = supabase.table('users').update(update_payload).eq('user_id', user_id).execute()
+
+        response = supabase.table('users').update(update_payload).eq('user_id', user_id).execute(returning="representation")
+        
         if not response.data:
-            check_user = supabase.table('users').select('user_id').eq('user_id', user_id).maybe_single().execute()
-            if not check_user.data:
-                raise HTTPException(status_code=404, detail="Utente non trovato.")
-        return {"status": "success", "message": "Profilo aggiornato con successo."}
+            raise HTTPException(status_code=404, detail="Utente non trovato o nessun dato è stato modificato.")
+        
+        return {"status": "success", "message": "Profilo aggiornato con successo.", "data": response.data[0]}
     except Exception as e:
         print(f"Errore in update_profile: {e}")
         raise HTTPException(status_code=500, detail="Errore durante l'aggiornamento del profilo.")
