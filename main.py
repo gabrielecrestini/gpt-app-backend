@@ -1,4 +1,4 @@
-# main.py - Versione Definitiva, Stabile e Completa
+# main.py - Versione Finale Definitiva - Connessioni Robuste e Tutte le Funzionalità
 # Data: 30 Giugno 2025
 
 # --- Import delle librerie ---
@@ -24,7 +24,7 @@ load_dotenv()
 
 # Caricamento delle variabili d'ambiente
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY") 
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 GCP_REGION = os.environ.get("GCP_REGION")
 GCP_SA_KEY_JSON_STR = os.environ.get("GCP_SA_KEY_JSON")
@@ -80,7 +80,7 @@ class SubmissionRequest(BaseModel):
 class PurchaseRequest(BaseModel):
     user_id: str
     item_id: int
-
+    
 class UserProfileUpdate(BaseModel):
     displayName: str | None = None
     avatar_url: str | None = None
@@ -235,11 +235,15 @@ def claim_streak_bonus(user_id: str):
         status_response = get_streak_status(user_id=user_id)
         if not status_response.get("canClaim"):
             raise HTTPException(status_code=400, detail="Bonus giornaliero già riscosso.")
+        
         reward = min(status_response.get("days", 0) * 10, 100)
+        
         supabase = get_supabase_client()
         user_res = supabase.table('users').select('points_balance').eq('user_id', user_id).single().execute()
         new_balance = user_res.data.get('points_balance', 0) + reward
+        
         supabase.table('users').update({'points_balance': new_balance, 'last_streak_claim_at': datetime.now(timezone.utc).isoformat()}).eq('user_id', user_id).execute()
+        
         return {"status": "success", "message": f"Hai riscattato {reward} Zenith Coins!", "new_balance": new_balance}
     except HTTPException as http_exc:
         raise http_exc
@@ -247,39 +251,47 @@ def claim_streak_bonus(user_id: str):
         print(f"Errore in claim_streak_bonus: {e}")
         raise HTTPException(status_code=500, detail="Errore durante la riscossione del bonus.")
 
+@app.get("/shop/items")
+def get_shop_items():
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table("shop_items").select("*").eq("is_active", True).order("price").execute()
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Impossibile caricare gli oggetti del negozio.")
+
+@app.post("/shop/buy")
+def buy_shop_item(req: PurchaseRequest):
+    try:
+        supabase = get_supabase_client()
+        supabase.rpc('purchase_item', {'p_user_id': req.user_id, 'p_item_id': req.item_id}).execute()
+        return {"status": "success", "message": "Acquisto completato!"}
+    except Exception as e:
+        if 'Fondi insufficienti' in str(e):
+            raise HTTPException(status_code=402, detail="Zenith Coins insufficienti.")
+        print(f"Errore acquisto: {e}")
+        raise HTTPException(status_code=500, detail="Errore durante l'acquisto.")
+
 @app.get("/missions/{user_id}")
 def get_missions(user_id: str):
     raise HTTPException(status_code=501, detail="Funzionalità missioni non ancora implementata.")
 
-# --- ENDPOINT AGGIORNATO ---
 @app.post("/update_profile/{user_id}")
 def update_profile(user_id: str, profile_data: UserProfileUpdate):
-    """
-    Aggiorna il profilo di un utente, come il nome visualizzato o l'avatar scelto.
-    """
     try:
         supabase = get_supabase_client()
-        
         update_payload = {}
-        # Costruiamo dinamicamente il payload per aggiornare solo i campi forniti
         if profile_data.displayName is not None:
             update_payload['display_name'] = profile_data.displayName
         if profile_data.avatar_url is not None:
             update_payload['avatar_url'] = profile_data.avatar_url
-
         if not update_payload:
             raise HTTPException(status_code=400, detail="Nessun dato fornito per l'aggiornamento.")
-
         response = supabase.table('users').update(update_payload).eq('user_id', user_id).execute()
-        
-        # La chiamata 'update' restituisce dati solo se specificato, quindi controlliamo se ha avuto effetto
         if not response.data:
-            # Potrebbe essere che l'utente non esista, o che i dati fossero identici
-            # Verifichiamo se l'utente esiste per dare un errore più specifico
             check_user = supabase.table('users').select('user_id').eq('user_id', user_id).maybe_single().execute()
             if not check_user.data:
                 raise HTTPException(status_code=404, detail="Utente non trovato.")
-        
         return {"status": "success", "message": "Profilo aggiornato con successo."}
     except Exception as e:
         print(f"Errore in update_profile: {e}")
