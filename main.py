@@ -66,23 +66,22 @@ class PurchaseRequest(BaseModel):
 class UserProfileUpdate(BaseModel):
     displayName: str | None = None; avatar_url: str | None = None
 
-# --- Funzione Helper per il Client Supabase ---
+# --- Funzioni Helper ---
 def get_supabase_client() -> Client:
     """Crea e restituisce un client Supabase nuovo e pulito per ogni richiesta."""
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_KEY")
-    if not all([url, key]): raise ValueError("Variabili d'ambiente di Supabase non impostate.")
+    url, key = os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY")
+    if not all([url, key]): raise ValueError("Variabili Supabase non impostate.")
     return create_client(url, key)
 
 def generate_daily_theme() -> str:
     """Usa Vertex AI (Gemini) per generare un tema artistico creativo e breve."""
     try:
         model = GenerativeModel("gemini-1.0-pro")
-        prompt = "Genera un tema artistico breve, creativo e stimolante (massimo 10 parole). Fornisci solo il testo del tema."
+        prompt = "Genera un tema artistico breve, creativo e stimolante (massimo 10 parole) per una competizione di arte digitale. Fornisci solo il testo del tema, senza virgolette o prefissi."
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
-        print(f"Errore generazione tema AI: {e}"); return "Una balena meccanica tra le nuvole."
+        print(f"Errore generazione tema AI: {e}"); return "Una balena meccanica che nuota tra le nuvole."
 
 # --- Endpoint dell'API ---
 
@@ -94,7 +93,7 @@ def sync_user(user_data: UserSyncRequest):
     try:
         supabase = get_supabase_client()
         response = supabase.table('users').select('last_login_at, login_streak').eq('user_id', user_data.user_id).execute()
-        if not response: raise Exception("CRITICO: Risposta nulla dal database.")
+        if not response: raise Exception("CRITICO: La risposta dal database era nulla (None).")
         now = datetime.now(timezone.utc)
         if not response.data or len(response.data) == 0:
             new_user_record = {'user_id': user_data.user_id, 'email': user_data.email, 'display_name': user_data.displayName, 'referrer_id': user_data.referrer_id, 'avatar_url': user_data.avatar_url, 'login_streak': 1, 'last_login_at': now.isoformat(), 'points_balance': 0}
@@ -117,21 +116,18 @@ def update_profile(user_id: str, profile_data: UserProfileUpdate):
         update_payload = profile_data.dict(exclude_unset=True)
         if not update_payload: raise HTTPException(status_code=400, detail="Nessun dato fornito per l'aggiornamento.")
         supabase.table('users').update(update_payload).eq('user_id', user_id).execute()
-        return {"status": "success", "message": "Profilo aggiornato."}
-    except Exception as e: print(f"Errore in update_profile: {e}"); raise HTTPException(status_code=500, detail="Errore durante l'aggiornamento.")
+        return {"status": "success", "message": "Profilo aggiornato con successo."}
+    except Exception as e: print(f"Errore in update_profile: {e}"); raise HTTPException(status_code=500, detail="Errore durante l'aggiornamento del profilo.")
 
 @app.post("/request_payout")
 def request_payout(payout_data: PayoutRequest):
     try:
         supabase = get_supabase_client()
         value_eur = payout_data.points_amount / POINTS_TO_EUR_RATE
-        supabase.rpc('request_payout_function', {
-            'p_user_id': payout_data.user_id, 'p_points_amount': payout_data.points_amount,
-            'p_value_in_eur': value_eur, 'p_method': payout_data.method, 'p_address': payout_data.address
-        }).execute()
+        supabase.rpc('request_payout_function', { 'p_user_id': payout_data.user_id, 'p_points_amount': payout_data.points_amount, 'p_value_in_eur': value_eur, 'p_method': payout_data.method, 'p_address': payout_data.address }).execute()
         return {"status": "success", "message": "La tua richiesta di prelievo è stata inviata!"}
     except Exception as e:
-        if 'Punti insufficienti' in str(e): raise HTTPException(status_code=402, detail="Punti insufficienti.")
+        if 'Punti insufficienti' in str(e): raise HTTPException(status_code=402, detail="Punti insufficienti per effettuare questo prelievo.")
         print(f"Errore in request_payout: {e}"); raise HTTPException(status_code=500, detail="Errore durante la richiesta.")
 
 @app.get("/get_user_balance/{user_id}")
