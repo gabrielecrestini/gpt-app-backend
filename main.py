@@ -77,7 +77,7 @@ def generate_daily_theme() -> str:
     """Usa Vertex AI (Gemini) per generare un tema artistico creativo e breve."""
     try:
         model = GenerativeModel("gemini-1.0-pro")
-        prompt = "Genera un tema artistico breve, creativo e stimolante (massimo 10 parole) per una competizione di arte digitale. Fornisci solo il testo del tema, senza virgolette o prefissi."
+        prompt = "Genera un tema artistico breve, creativo, surreale e stimolante (massimo 10 parole) per una competizione di arte digitale. Fornisci solo il testo del tema, senza virgolette o prefissi."
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
@@ -93,7 +93,7 @@ def sync_user(user_data: UserSyncRequest):
     try:
         supabase = get_supabase_client()
         response = supabase.table('users').select('last_login_at, login_streak').eq('user_id', user_data.user_id).execute()
-        if not response: raise Exception("CRITICO: La risposta dal database era nulla (None).")
+        if not response: raise Exception("CRITICO: Risposta nulla dal database.")
         now = datetime.now(timezone.utc)
         if not response.data or len(response.data) == 0:
             new_user_record = {'user_id': user_data.user_id, 'email': user_data.email, 'display_name': user_data.displayName, 'referrer_id': user_data.referrer_id, 'avatar_url': user_data.avatar_url, 'login_streak': 1, 'last_login_at': now.isoformat(), 'points_balance': 0}
@@ -113,7 +113,9 @@ def sync_user(user_data: UserSyncRequest):
 def update_profile(user_id: str, profile_data: UserProfileUpdate):
     try:
         supabase = get_supabase_client()
-        update_payload = profile_data.dict(exclude_unset=True)
+        update_payload = {}
+        if profile_data.displayName is not None: update_payload['display_name'] = profile_data.displayName
+        if profile_data.avatar_url is not None: update_payload['avatar_url'] = profile_data.avatar_url
         if not update_payload: raise HTTPException(status_code=400, detail="Nessun dato fornito per l'aggiornamento.")
         supabase.table('users').update(update_payload).eq('user_id', user_id).execute()
         return {"status": "success", "message": "Profilo aggiornato con successo."}
@@ -194,12 +196,18 @@ def get_current_contest():
         supabase = get_supabase_client()
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         response = supabase.table('ai_contests').select('*').gte('created_at', today_start.isoformat()).order('id', desc=True).limit(1).execute()
-        if response.data: return response.data[0]
+        if response.data:
+            return response.data[0]
         new_theme = generate_daily_theme()
         new_contest_data = {"theme_prompt": new_theme, "start_date": today_start.isoformat(), "end_date": (today_start + timedelta(days=1)).isoformat(), "status": "active", "prize_pool": 10000}
-        insert_response = supabase.table('ai_contests').insert(new_contest_data).execute(returning="representation")
-        return insert_response.data[0]
-    except Exception as e: print(f"Errore in get_current_contest: {e}"); raise HTTPException(status_code=500, detail="Impossibile caricare il contest.")
+        insert_response = supabase.table('ai_contests').insert(new_contest_data).execute()
+        new_contest_query = supabase.table('ai_contests').select('*').eq('theme_prompt', new_theme).order('id', desc=True).limit(1).execute()
+        if not new_contest_query.data:
+            raise Exception("Fallimento nel recuperare il contest appena creato.")
+        return new_contest_query.data[0]
+    except Exception as e:
+        print(f"ERRORE CRITICO in get_current_contest: {e}")
+        raise HTTPException(status_code=500, detail="Impossibile caricare o creare il contest del giorno.")
 
 @app.post("/contests/generate_image")
 def generate_ai_image(req: ImageGenerationRequest):
