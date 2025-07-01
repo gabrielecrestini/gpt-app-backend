@@ -1,4 +1,4 @@
-# main.py - Versione Finale, Stabile e Completa
+# main.py - Versione Finale, Stabile e Corretta
 # Data: 1 Luglio 2025
 
 # --- Import delle librerie ---
@@ -94,6 +94,17 @@ def get_supabase_client() -> Client:
         raise ValueError("Variabili d'ambiente di Supabase non impostate.")
     return create_client(url, key)
 
+def generate_daily_theme() -> str:
+    """Usa Vertex AI (Gemini) per generare un tema artistico creativo e breve."""
+    try:
+        model = GenerativeModel("gemini-1.0-pro")
+        prompt = "Genera un tema artistico breve, creativo, surreale e stimolante (massimo 10 parole) per una competizione di arte digitale. Fornisci solo il testo del tema, senza virgolette, prefissi o spiegazioni."
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print(f"Errore durante la generazione del tema AI: {e}")
+        return "Una balena meccanica che nuota tra le nuvole."
+
 # --- Endpoint dell'API ---
 
 @app.get("/")
@@ -128,6 +139,23 @@ def sync_user(user_data: UserSyncRequest):
         print(f"Errore finale in sync_user: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/update_profile/{user_id}")
+def update_profile(user_id: str, profile_data: UserProfileUpdate):
+    try:
+        supabase = get_supabase_client()
+        update_payload = {}
+        if profile_data.displayName is not None:
+            update_payload['display_name'] = profile_data.displayName
+        if profile_data.avatar_url is not None:
+            update_payload['avatar_url'] = profile_data.avatar_url
+        if not update_payload:
+            raise HTTPException(status_code=400, detail="Nessun dato fornito per l'aggiornamento.")
+        supabase.table('users').update(update_payload).eq('user_id', user_id).execute()
+        return {"status": "success", "message": "Profilo aggiornato con successo."}
+    except Exception as e:
+        print(f"Errore in update_profile: {e}")
+        raise HTTPException(status_code=500, detail="Errore durante l'aggiornamento del profilo.")
+
 @app.get("/get_user_balance/{user_id}")
 def get_user_balance(user_id: str):
     try:
@@ -140,76 +168,6 @@ def get_user_balance(user_id: str):
         raise http_exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/request_payout")
-def request_payout(payout_data: PayoutRequest):
-    raise HTTPException(status_code=501, detail="Funzionalità di prelievo non ancora implementata.")
-
-@app.get("/contests/current")
-def get_current_contest():
-    return {"id": 1, "theme_prompt": "Un robot che dipinge un tramonto, stile Van Gogh"}
-
-@app.post("/contests/generate_image")
-def generate_ai_image(req: ImageGenerationRequest):
-    try:
-        supabase = get_supabase_client()
-        user_response = supabase.table('users').select('points_balance').eq('user_id', req.user_id).maybe_single().execute()
-        if not user_response or not user_response.data:
-            raise HTTPException(status_code=404, detail="Utente non trovato.")
-        if user_response.data.get('points_balance', 0) < IMAGE_GENERATION_COST:
-            raise HTTPException(status_code=402, detail="Zenith Coins insufficienti.")
-        new_balance = user_response.data.get('points_balance', 0) - IMAGE_GENERATION_COST
-        supabase.table('users').update({'points_balance': new_balance}).eq('user_id', req.user_id).execute()
-        model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-002")
-        images = model.generate_images(prompt=req.prompt, number_of_images=1, aspect_ratio="1:1")
-        base64_image = base64.b64encode(images[0]._image_bytes).decode('utf-8')
-        return {"image_url": f"data:image/png;base64,{base64_image}", "new_balance": new_balance}
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        print(f"Errore in generate_image: {e}")
-        raise HTTPException(status_code=500, detail="Errore interno del server.")
-
-@app.post("/contests/submit")
-def submit_artwork(req: SubmissionRequest):
-    raise HTTPException(status_code=501, detail="Funzionalità di invio opera non ancora implementata.")
-
-@app.get("/contests/{contest_id}/submissions")
-def get_contest_submissions(contest_id: int):
-    try:
-        supabase = get_supabase_client()
-        response = supabase.table("ai_submissions").select("*, user:users(display_name, avatar_url)").eq("contest_id", contest_id).order("votes", desc=True).execute()
-        return response.data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Impossibile caricare le opere della community.")
-
-@app.post("/submissions/{submission_id}/vote")
-def vote_for_submission(submission_id: int):
-    try:
-        supabase = get_supabase_client()
-        supabase.rpc('increment_votes', {'submission_id_in': submission_id}).execute()
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Errore durante la votazione.")
-
-@app.get("/leaderboard")
-def get_leaderboard():
-    try:
-        supabase = get_supabase_client()
-        response = supabase.table('users').select('display_name, points_balance, avatar_url').order('points_balance', desc=True).limit(10).execute()
-        leaderboard_data = [{"name": u.get('display_name', 'N/A'), "points_balance": u.get('points_balance', 0), "avatar": u.get('avatar_url', ''), "earnings": u.get('points_balance', 0) / POINTS_TO_EUR_RATE} for u in response.data]
-        return leaderboard_data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Errore nel caricamento della classifica.")
-
-@app.get("/referral_stats/{user_id}")
-def get_referral_stats(user_id: str):
-    try:
-        supabase = get_supabase_client()
-        response = supabase.table('users').select('user_id', count='exact').eq('referrer_id', user_id).execute()
-        return {"referral_count": response.count or 0, "referral_earnings": 0.00}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Errore nel recupero delle statistiche referral.")
 
 @app.get("/streak/status/{user_id}")
 def get_streak_status(user_id: str):
@@ -235,21 +193,82 @@ def claim_streak_bonus(user_id: str):
         status_response = get_streak_status(user_id=user_id)
         if not status_response.get("canClaim"):
             raise HTTPException(status_code=400, detail="Bonus giornaliero già riscosso.")
-        
         reward = min(status_response.get("days", 0) * 10, 100)
-        
         supabase = get_supabase_client()
         user_res = supabase.table('users').select('points_balance').eq('user_id', user_id).single().execute()
         new_balance = user_res.data.get('points_balance', 0) + reward
-        
         supabase.table('users').update({'points_balance': new_balance, 'last_streak_claim_at': datetime.now(timezone.utc).isoformat()}).eq('user_id', user_id).execute()
-        
         return {"status": "success", "message": f"Hai riscattato {reward} Zenith Coins!", "new_balance": new_balance}
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
         print(f"Errore in claim_streak_bonus: {e}")
-        raise HTTPException(status_code=500, detail="Errore durante la riscossione del bonus.")
+        raise HTTPException(status_code=500, detail="Errore durante la riscossione.")
+
+@app.get("/leaderboard")
+def get_leaderboard():
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table('users').select('display_name, points_balance, avatar_url').order('points_balance', desc=True).limit(10).execute()
+        leaderboard_data = [{"name": u.get('display_name', 'N/A'), "points_balance": u.get('points_balance', 0), "avatar": u.get('avatar_url', ''), "earnings": u.get('points_balance', 0) / POINTS_TO_EUR_RATE} for u in response.data]
+        return leaderboard_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Errore nel caricamento della classifica.")
+
+@app.get("/contests/current")
+def get_current_contest():
+    try:
+        supabase = get_supabase_client()
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        response = supabase.table('ai_contests').select('*').gte('created_at', today_start.isoformat()).order('id', desc=True).limit(1).execute()
+        if response.data:
+            return response.data[0]
+        new_theme = generate_daily_theme()
+        new_contest_data = {"theme_prompt": new_theme, "start_date": today_start.isoformat(), "end_date": (today_start + timedelta(days=1)).isoformat(), "status": "active", "prize_pool": 10000}
+        insert_response = supabase.table('ai_contests').insert(new_contest_data).execute(returning="representation")
+        return insert_response.data[0]
+    except Exception as e:
+        print(f"Errore in get_current_contest: {e}")
+        raise HTTPException(status_code=500, detail="Impossibile caricare il contest del giorno.")
+
+@app.post("/contests/generate_image")
+def generate_ai_image(req: ImageGenerationRequest):
+    try:
+        supabase = get_supabase_client()
+        user_response = supabase.table('users').select('points_balance').eq('user_id', req.user_id).maybe_single().execute()
+        if not user_response or not user_response.data:
+            raise HTTPException(status_code=404, detail="Utente non trovato.")
+        if user_response.data.get('points_balance', 0) < IMAGE_GENERATION_COST:
+            raise HTTPException(status_code=402, detail="Zenith Coins insufficienti.")
+        new_balance = user_response.data.get('points_balance', 0) - IMAGE_GENERATION_COST
+        supabase.table('users').update({'points_balance': new_balance}).eq('user_id', req.user_id).execute()
+        model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-002")
+        images = model.generate_images(prompt=req.prompt, number_of_images=1, aspect_ratio="1:1")
+        base64_image = base64.b64encode(images[0]._image_bytes).decode('utf-8')
+        return {"image_url": f"data:image/png;base64,{base64_image}", "new_balance": new_balance}
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        print(f"Errore in generate_image: {e}")
+        raise HTTPException(status_code=500, detail="Errore interno del server.")
+
+@app.get("/contests/{contest_id}/submissions")
+def get_contest_submissions(contest_id: int):
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table("ai_submissions").select("*, user:users(display_name, avatar_url)").eq("contest_id", contest_id).order("votes", desc=True).execute()
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Impossibile caricare le opere della community.")
+
+@app.post("/submissions/{submission_id}/vote")
+def vote_for_submission(submission_id: int):
+    try:
+        supabase = get_supabase_client()
+        supabase.rpc('increment_votes', {'submission_id_in': submission_id}).execute()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Errore durante la votazione.")
 
 @app.get("/shop/items")
 def get_shop_items():
@@ -272,26 +291,23 @@ def buy_shop_item(req: PurchaseRequest):
         print(f"Errore acquisto: {e}")
         raise HTTPException(status_code=500, detail="Errore durante l'acquisto.")
 
+@app.post("/request_payout")
+def request_payout(payout_data: PayoutRequest):
+    raise HTTPException(status_code=501, detail="Funzionalità non implementata.")
+
+@app.post("/contests/submit")
+def submit_artwork(req: SubmissionRequest):
+    raise HTTPException(status_code=501, detail="Non implementato.")
+
 @app.get("/missions/{user_id}")
 def get_missions(user_id: str):
-    raise HTTPException(status_code=501, detail="Funzionalità missioni non ancora implementata.")
+    raise HTTPException(status_code=501, detail="Funzionalità non implementata.")
 
-@app.post("/update_profile/{user_id}")
-def update_profile(user_id: str, profile_data: UserProfileUpdate):
+@app.get("/referral_stats/{user_id}")
+def get_referral_stats(user_id: str):
     try:
         supabase = get_supabase_client()
-        update_payload = {}
-        if profile_data.displayName is not None:
-            update_payload['display_name'] = profile_data.displayName
-        if profile_data.avatar_url is not None:
-            update_payload['avatar_url'] = profile_data.avatar_url
-
-        if not update_payload:
-            raise HTTPException(status_code=400, detail="Nessun dato fornito per l'aggiornamento.")
-            
-        supabase.table('users').update(update_payload).eq('user_id', user_id).execute()
-        
-        return {"status": "success", "message": "Profilo aggiornato con successo."}
+        response = supabase.table('users').select('user_id', count='exact').eq('referrer_id', user_id).execute()
+        return {"referral_count": response.count or 0, "referral_earnings": 0.00}
     except Exception as e:
-        print(f"Errore in update_profile: {e}")
-        raise HTTPException(status_code=500, detail="Errore durante l'aggiornamento del profilo.")
+        raise HTTPException(status_code=500, detail="Errore nel recupero delle statistiche referral.")
