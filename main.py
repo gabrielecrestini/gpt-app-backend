@@ -1,4 +1,4 @@
-# main.py - Versione Definitiva, Stabile e Completa
+# main.py - Versione Finale, Stabile e Completa
 # Data: 1 Luglio 2025
 
 # --- Import delle librerie ---
@@ -7,6 +7,7 @@ import json
 import base64
 import time
 from datetime import datetime, timezone, timedelta
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -279,10 +280,15 @@ def get_missions(user_id: str):
 def update_profile(user_id: str, profile_data: UserProfileUpdate):
     try:
         supabase = get_supabase_client()
-        update_payload = profile_data.dict(exclude_unset=True)
+        update_payload = {}
+        if profile_data.displayName is not None:
+            update_payload['display_name'] = profile_data.displayName
+        if profile_data.avatar_url is not None:
+            update_payload['avatar_url'] = profile_data.avatar_url
+
         if not update_payload:
             raise HTTPException(status_code=400, detail="Nessun dato fornito per l'aggiornamento.")
-        
+            
         supabase.table('users').update(update_payload).eq('user_id', user_id).execute()
         
         return {"status": "success", "message": "Profilo aggiornato con successo."}
