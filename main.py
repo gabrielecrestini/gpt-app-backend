@@ -1,5 +1,5 @@
-# main.py - Versione Finale, Stabile e Completa
-# Data: 30 Giugno 2025
+# main.py - Versione Definitiva, Stabile e Completa
+# Data: 1 Luglio 2025
 
 # --- Import delle librerie ---
 import os
@@ -7,7 +7,6 @@ import json
 import base64
 import time
 from datetime import datetime, timezone, timedelta
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -283,10 +282,10 @@ def update_profile(user_id: str, profile_data: UserProfileUpdate):
         update_payload = profile_data.dict(exclude_unset=True)
         if not update_payload:
             raise HTTPException(status_code=400, detail="Nessun dato fornito per l'aggiornamento.")
-        response = supabase.table('users').update(update_payload).eq('user_id', user_id).execute(returning="representation")
-        if not response.data:
-            raise HTTPException(status_code=404, detail="Utente non trovato o nessun dato è stato modificato.")
-        return {"status": "success", "message": "Profilo aggiornato con successo.", "data": response.data[0]}
+        
+        supabase.table('users').update(update_payload).eq('user_id', user_id).execute()
+        
+        return {"status": "success", "message": "Profilo aggiornato con successo."}
     except Exception as e:
         print(f"Errore in update_profile: {e}")
         raise HTTPException(status_code=500, detail="Errore durante l'aggiornamento del profilo.")
