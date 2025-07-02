@@ -5,6 +5,7 @@
 import os
 import time
 from datetime import datetime, timezone, timedelta
+import base64
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
@@ -22,6 +23,7 @@ STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
 PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
+PAYPAL_WEBHOOK_ID = os.environ.get("PAYPAL_WEBHOOK_ID")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
@@ -48,41 +50,37 @@ if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
 # Configurazione Stripe e PayPal
 if STRIPE_SECRET_KEY: stripe.api_key = STRIPE_SECRET_KEY
 if all([PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET]):
-    paypalrestsdk.configure({
-        "mode": "live",  # Cambia in "sandbox" per i test
-        "client_id": PAYPAL_CLIENT_ID,
-        "client_secret": PAYPAL_CLIENT_SECRET
-    })
+    paypalrestsdk.configure({ "mode": "live", "client_id": PAYPAL_CLIENT_ID, "client_secret": PAYPAL_CLIENT_SECRET })
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "https://cashhh-52f38.web.app", "https://cashhh-52738.web.app"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
 # --- Modelli Dati (Pydantic) ---
-IMAGE_GENERATION_COST = 50
-IMAGE_GENERATION_EUR_PRICE = 0.50
 POINTS_TO_EUR_RATE = 1000.0
+IMAGE_GENERATION_EUR_PRICE = 1.00
+IMAGE_GENERATION_POINTS_COST = 1000
+IMAGE_GENERATION_POINTS_COST_DISCOUNTED = 50
+
 
 class UserSyncRequest(BaseModel): user_id: str; email: str | None = None; displayName: str | None = None; referrer_id: str | None = None; avatar_url: str | None = None
-class ImageGenerationRequest(BaseModel): user_id: str; prompt: str; contest_id: int; payment_method: str
+class AIGenerationRequest(BaseModel): user_id: str; prompt: str; content_type: str; payment_method: str; contest_id: int | None = None
 class PayoutRequest(BaseModel): user_id: str; points_amount: int; method: str; address: str
-class SubmissionRequest(BaseModel): contest_id: int; user_id: str; image_url: str; prompt: str
 class UserProfileUpdate(BaseModel): display_name: str | None = None; avatar_url: str | None = None
 class PurchaseRequest(BaseModel): user_id: str; item_id: int; payment_method: str
+class SubmissionRequest(BaseModel): contest_id: int; user_id: str; image_url: str; prompt: str
 
 # --- Funzioni Helper ---
 def get_supabase_client() -> Client: return create_client(SUPABASE_URL, SUPABASE_KEY)
-def generate_daily_theme() -> str:
+def generate_viral_plan(prompt: str) -> str:
     try:
-        model = GenerativeModel("gemini-1.0-pro")
-        prompt = "Genera un tema artistico breve, creativo e stimolante (massimo 10 parole)."
-        return model.generate_content(prompt).text.strip()
+        model = GenerativeModel("gemini-1.5-flash")
+        ai_prompt = f"Dato il seguente prompt creativo: '{prompt}', crea un piano marketing in 3 brevi punti per rendere virale un post basato su questo contenuto sui social media (come Instagram o TikTok). Sii conciso e d'impatto. Usa emoji."
+        return model.generate_content(ai_prompt).text.strip()
     except Exception as e:
-        print(f"Errore generazione tema AI: {e}"); return "Una balena meccanica che nuota tra le nuvole."
+        print(f"Errore generazione piano virale: {e}"); return "1. Usa hashtag di tendenza. 2. Crea un video breve e d'impatto. 3. Interagisci con i commenti."
 
 # --- Endpoint API ---
 
@@ -96,7 +94,7 @@ def sync_user(user_data: UserSyncRequest):
     try:
         response = supabase.table('users').select('user_id, last_login_at, login_streak').eq('user_id', user_data.user_id).single().execute()
         if not response.data:
-            new_user_record = {'user_id': user_data.user_id, 'email': user_data.email, 'display_name': user_data.displayName, 'referrer_id': user_data.referrer_id, 'avatar_url': user_data.avatar_url, 'login_streak': 1, 'last_login_at': now.isoformat(), 'points_balance': 0}
+            new_user_record = {'user_id': user_data.user_id, 'email': user_data.email, 'display_name': user_data.displayName, 'referrer_id': user_data.referrer_id, 'avatar_url': user_data.avatar_url, 'login_streak': 1, 'last_login_at': now.isoformat(), 'points_balance': 0, 'free_generations_used': 0}
             supabase.table('users').insert(new_user_record).execute()
         else:
             user = response.data
@@ -107,8 +105,7 @@ def sync_user(user_data: UserSyncRequest):
                 elif days_diff > 1: new_streak = 1
             supabase.table('users').update({'last_login_at': now.isoformat(), 'login_streak': new_streak}).eq('user_id', user_data.user_id).execute()
         return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/update_profile/{user_id}")
 def update_profile(user_id: str, profile_data: UserProfileUpdate):
@@ -117,9 +114,8 @@ def update_profile(user_id: str, profile_data: UserProfileUpdate):
         update_payload = profile_data.dict(exclude_unset=True)
         if not update_payload: raise HTTPException(status_code=400, detail="Nessun dato fornito.")
         supabase.table('users').update(update_payload).eq('user_id', user_id).execute()
-        return {"status": "success", "message": "Profilo aggiornato con successo."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"status": "success", "message": "Profilo aggiornato."}
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/request_payout")
 def request_payout(payout_data: PayoutRequest):
@@ -128,8 +124,7 @@ def request_payout(payout_data: PayoutRequest):
         user_res = supabase.table("users").select("points_balance").eq("user_id", payout_data.user_id).single().execute()
         if not user_res.data or user_res.data.get("points_balance", 0) < payout_data.points_amount:
             raise HTTPException(status_code=402, detail="Punti prelevabili insufficienti.")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore nel verificare il saldo: {e}")
+    except Exception as e: raise HTTPException(status_code=500, detail=f"Errore saldo: {e}")
 
     if payout_data.method == 'PayPal':
         try:
@@ -137,11 +132,9 @@ def request_payout(payout_data: PayoutRequest):
             payout = paypalrestsdk.Payout({"sender_batch_header": {"sender_batch_id": f"payout_{time.time()}", "email_subject": "Hai ricevuto un pagamento da Zenith Rewards!"}, "items": [{"recipient_type": "EMAIL", "amount": {"value": value_eur, "currency": "EUR"}, "receiver": payout_data.address, "note": "Grazie per aver usato Zenith Rewards!", "sender_item_id": f"item_{time.time()}"}]})
             if payout.create():
                 supabase.rpc('add_points', {'user_id_in': payout_data.user_id, 'points_to_add': -payout_data.points_amount}).execute()
-                return {"status": "success", "message": "La tua richiesta di prelievo PayPal è stata elaborata!"}
-            else:
-                raise HTTPException(status_code=500, detail=payout.error)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Errore durante il prelievo PayPal: {e}")
+                return {"status": "success", "message": "Prelievo PayPal elaborato!"}
+            else: raise HTTPException(status_code=500, detail=payout.error)
+        except Exception as e: raise HTTPException(status_code=500, detail=f"Errore PayPal: {e}")
     else:
         supabase.rpc('add_points', {'user_id_in': payout_data.user_id, 'points_to_add': -payout_data.points_amount}).execute()
         return {"status": "success", "message": f"Richiesta di prelievo {payout_data.method} ricevuta."}
@@ -151,8 +144,8 @@ def get_user_balance(user_id: str):
     try:
         supabase = get_supabase_client()
         response = supabase.table('users').select('points_balance').eq('user_id', user_id).maybe_single().execute()
-        if not response.data: return {"points_balance": 0, "pending_points_balance": 0}
-        return {"points_balance": response.data.get('points_balance', 0), "pending_points_balance": 0}
+        if not response.data: return {"points_balance": 0}
+        return {"points_balance": response.data.get('points_balance', 0)}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/streak/status/{user_id}")
@@ -171,7 +164,7 @@ def get_streak_status(user_id: str):
 def claim_streak_bonus(user_id: str):
     try:
         status = get_streak_status(user_id)
-        if not status["canClaim"]: raise HTTPException(status_code=400, detail="Bonus giornaliero già riscosso.")
+        if not status["canClaim"]: raise HTTPException(status_code=400, detail="Bonus già riscosso.")
         reward = min(status["days"] * 10, 100)
         supabase = get_supabase_client()
         supabase.rpc('add_points', {'user_id_in': user_id, 'points_to_add': reward}).execute()
@@ -203,10 +196,10 @@ def buy_shop_item(req: PurchaseRequest):
     if req.payment_method == 'points':
         try:
             supabase.rpc('purchase_item', {'p_user_id': req.user_id, 'p_item_id': req.item_id}).execute()
-            return {"status": "success", "message": "Acquisto completato con i tuoi Zenith Coins!"}
+            return {"status": "success", "message": "Acquisto completato!"}
         except Exception as e:
             if 'Fondi insufficienti' in str(e): raise HTTPException(status_code=402, detail="Zenith Coins insufficienti.")
-            raise HTTPException(status_code=500, detail="Errore durante l'acquisto con punti.")
+            raise HTTPException(status_code=500, detail="Errore durante l'acquisto.")
     elif req.payment_method == 'stripe':
         try:
             price_in_eur = item.get("price_eur")
@@ -219,90 +212,117 @@ def buy_shop_item(req: PurchaseRequest):
     else:
         raise HTTPException(status_code=400, detail="Metodo di pagamento non valido.")
 
+@app.post("/ai/generate")
+def generate_ai_content(req: AIGenerationRequest):
+    supabase = get_supabase_client()
+    user_res = supabase.table("users").select("points_balance, free_generations_used").eq("user_id", req.user_id).single().execute()
+    if not user_res.data: raise HTTPException(status_code=404, detail="Utente non trovato.")
+    user = user_res.data
+
+    cost_in_points = IMAGE_GENERATION_POINTS_COST
+    is_paid_generation = True
+    if user.get('free_generations_used', 0) < 3:
+        cost_in_points = IMAGE_GENERATION_POINTS_COST_DISCOUNTED
+        is_paid_generation = False
+    
+    client_secret_for_frontend = None
+    if req.payment_method == 'points':
+        if user.get('points_balance', 0) < cost_in_points: raise HTTPException(status_code=402, detail="Zenith Coins insufficienti.")
+        supabase.rpc('add_points', {'user_id_in': req.user_id, 'points_to_add': -cost_in_points}).execute()
+    elif req.payment_method == 'stripe':
+        if not is_paid_generation: raise HTTPException(status_code=400, detail="Pagamento in euro non disponibile per generazioni scontate.")
+        price_in_cents = int(IMAGE_GENERATION_EUR_PRICE * 100)
+        try:
+            payment_intent = stripe.PaymentIntent.create(amount=price_in_cents, currency="eur", automatic_payment_methods={"enabled": True}, metadata={'user_id': req.user_id, 'item_id': f'ai_generation_{req.content_type}'})
+            client_secret_for_frontend = payment_intent.client_secret
+        except Exception as e: raise HTTPException(status_code=500, detail=f"Errore Stripe: {e}")
+    else: raise HTTPException(status_code=400, detail="Metodo di pagamento non valido.")
+
+    if client_secret_for_frontend: return {"client_secret": client_secret_for_frontend, "payment_required": True}
+
+    try:
+        generated_url, generated_text = None, None
+        if req.content_type == 'IMAGE':
+            model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-002")
+            images = model.generate_images(prompt=req.prompt, number_of_images=1, aspect_ratio="1:1")
+            # In produzione, carica l'immagine su un bucket e salva l'URL. Per ora, usiamo base64.
+            generated_url = f"data:image/png;base64,{base64.b64encode(images[0]._image_bytes).decode('utf-8')}"
+        elif req.content_type == 'POST':
+            model = GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content(f"Scrivi un breve e coinvolgente post per Instagram basato su questo concetto: '{req.prompt}'")
+            generated_text = response.text.strip()
+        elif req.content_type == 'VIDEO': raise HTTPException(status_code=501, detail="Generazione video non implementata.")
+        
+        ai_strategy_plan = generate_viral_plan(req.prompt)
+        new_content = {"user_id": req.user_id, "content_type": req.content_type, "prompt": req.prompt, "generated_url": generated_url, "generated_text": generated_text, "ai_strategy_plan": ai_strategy_plan, "status": "DRAFT", "contest_id": req.contest_id}
+        insert_res = supabase.table("ai_content").insert(new_content, returning="representation").execute()
+        
+        if not is_paid_generation:
+            supabase.table("users").update({"free_generations_used": user.get('free_generations_used', 0) + 1}).eq("user_id", req.user_id).execute()
+        
+        return insert_res.data[0]
+    except Exception as e:
+        if req.payment_method == 'points': supabase.rpc('add_points', {'user_id_in': req.user_id, 'points_to_add': cost_in_points}).execute()
+        raise HTTPException(status_code=500, detail=f"Errore generazione AI: {e}")
+
+@app.post("/ai/content/{content_id}/publish")
+def publish_content(content_id: int):
+    supabase = get_supabase_client()
+    supabase.table("ai_content").update({"status": "PUBLISHED"}).eq("id", content_id).execute()
+    return {"status": "success", "message": "Contenuto pubblicato!"}
+
+@app.post("/ai/content/{content_id}/vote")
+def vote_for_content(content_id: int):
+    supabase = get_supabase_client()
+    supabase.rpc('increment_content_votes', {'content_id_in': content_id}).execute()
+    return {"status": "success"}
+
+@app.get("/leaderboard/weekly")
+def get_weekly_leaderboard():
+    supabase = get_supabase_client()
+    return supabase.rpc('get_weekly_leaderboard').execute().data
+
 @app.get("/contests/current")
 def get_current_contest():
     supabase = get_supabase_client()
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    response = supabase.table('ai_contests').select('*').gte('created_at', today_start.isoformat()).order('id', desc=True).limit(1).execute()
+    response = supabase.table('ai_contests').select('*').gte('start_date', today_start.isoformat()).lt('end_date', (today_start + timedelta(days=1)).isoformat()).eq('status','ACTIVE').limit(1).execute()
     if response.data: return response.data[0]
-    new_theme = generate_daily_theme()
-    new_contest_data = {"theme_prompt": new_theme, "start_date": today_start.isoformat(), "end_date": (today_start + timedelta(days=1)).isoformat(), "status": "active", "prize_pool": 10000}
-    insert_response = supabase.table('ai_contests').insert(new_contest_data).execute()
-    if not insert_response.data: raise HTTPException(status_code=500, detail="Impossibile creare il contest.")
-    return insert_response.data[0]
+    return {} # Restituisce un oggetto vuoto se non c'è un contest attivo
 
-@app.post("/contests/generate_image")
-def generate_ai_image(req: ImageGenerationRequest):
-    supabase = get_supabase_client()
-    # Logica di pagamento doppio
-    if req.payment_method == 'points':
-        user_res = supabase.table('users').select('points_balance').eq('user_id', req.user_id).single().execute()
-        if user_res.data.get('points_balance', 0) < IMAGE_GENERATION_COST: raise HTTPException(status_code=402, detail="Zenith Coins insufficienti.")
-        supabase.rpc('add_points', {'user_id_in': req.user_id, 'points_to_add': -IMAGE_GENERATION_COST}).execute()
-    elif req.payment_method == 'stripe':
-        price_in_cents = int(IMAGE_GENERATION_EUR_PRICE * 100)
-        try:
-            payment_intent = stripe.PaymentIntent.create(amount=price_in_cents, currency="eur", automatic_payment_methods={"enabled": True}, metadata={'user_id': req.user_id, 'item_id': 'image_generation'})
-            return {"client_secret": payment_intent.client_secret, "payment_required": True}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Errore Stripe: {e}")
-    else:
-        raise HTTPException(status_code=400, detail="Metodo di pagamento non valido.")
-    
-    # Se il pagamento è andato a buon fine, genera l'immagine
-    try:
-        model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-002")
-        images = model.generate_images(prompt=req.prompt, number_of_images=1, aspect_ratio="1:1")
-        base64_image = base64.b64encode(images[0]._image_bytes).decode('utf-8')
-        return {"image_url": f"data:image/png;base64,{base64_image}", "payment_required": False}
-    except Exception as e:
-        print(f"Errore in generate_image AI: {e}")
-        if req.payment_method == 'points':
-            supabase.rpc('add_points', {'user_id_in': req.user_id, 'points_to_add': IMAGE_GENERATION_COST}).execute()
-        raise HTTPException(status_code=500, detail="Errore durante la generazione dell'immagine.")
-
-@app.get("/contests/{contest_id}/submissions")
-def get_contest_submissions(contest_id: int):
-    supabase = get_supabase_client()
-    return supabase.table("ai_submissions").select("*, user:users(display_name, avatar_url)").eq("contest_id", contest_id).order("votes", desc=True).execute().data
-
-@app.post("/submissions/{submission_id}/vote")
-def vote_for_submission(submission_id: int):
-    supabase = get_supabase_client()
-    supabase.rpc('increment_votes', {'submission_id_in': submission_id}).execute()
-    return {"status": "success"}
-    
 @app.get("/referral_stats/{user_id}")
 def get_referral_stats(user_id: str):
     supabase = get_supabase_client()
     response = supabase.table('users').select('user_id', count='exact').eq('referrer_id', user_id).execute()
     return {"referral_count": response.count or 0, "referral_earnings": 0.00}
-
+    
 @app.post("/stripe-webhook")
 async def stripe_webhook(request: Request):
     payload = await request.body()
     sig_header = request.headers.get('stripe-signature')
     try:
         event = stripe.Webhook.construct_event(payload=payload, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Errore webhook: {e}")
+    except Exception as e: raise HTTPException(status_code=400, detail=f"Errore webhook: {e}")
+
     if event['type'] == 'payment_intent.succeeded':
         payment_intent = event['data']['object']
         metadata = payment_intent.get('metadata')
         if metadata:
             user_id = metadata.get('user_id')
             item_id_str = metadata.get('item_id')
-            if item_id_str == 'image_generation':
-                print(f"Pagamento Stripe per generazione immagine ricevuto per utente {user_id}")
-                # La generazione è già avvenuta nel frontend, qui potremmo solo registrarla se necessario
-            elif user_id and item_id_str:
-                print(f"Pagamento Stripe per articolo {item_id_str} ricevuto per utente {user_id}")
-                try:
-                    supabase = get_supabase_client()
-                    supabase.rpc('purchase_item', {'p_user_id': user_id, 'p_item_id': int(item_id_str)}).execute()
-                    print("Articolo consegnato con successo!")
-                except Exception as e:
-                    print(f"ERRORE CRITICO: Impossibile consegnare l'articolo {item_id_str} all'utente {user_id} dopo il pagamento. Errore: {e}")
+            if user_id and item_id_str:
+                if 'ai_generation' in item_id_str:
+                    print(f"Pagamento Stripe per generazione AI ricevuto per utente {user_id}")
+                    # La logica di generazione è gestita dal frontend dopo il pagamento.
+                    # Qui potremmo registrare la transazione o inviare una notifica.
+                else:
+                    try:
+                        print(f"Pagamento Stripe per articolo {item_id_str} ricevuto per utente {user_id}")
+                        supabase = get_supabase_client()
+                        supabase.rpc('purchase_item', {'p_user_id': user_id, 'p_item_id': int(item_id_str)}).execute()
+                        print("Articolo consegnato con successo!")
+                    except Exception as e:
+                        print(f"ERRORE CRITICO: Impossibile consegnare l'articolo {item_id_str}. Errore: {e}")
     return {"status": "success"}
 
 @app.get("/missions/{user_id}")
