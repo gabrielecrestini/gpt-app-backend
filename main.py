@@ -41,9 +41,14 @@ if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
     except Exception as e:
         print(f"ATTENZIONE: Errore nella configurazione di Vertex AI: {e}")
 
+# CORREZIONE CORS: Aggiornata la lista delle origini per includere l'URL corretto
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://cashhh-52f38.web.app"],
+    allow_origins=[
+        "http://localhost:3000", 
+        "https://cashhh-52f38.web.app", 
+        "https://cashhh-52738.web.app" # Aggiunto l'URL visto negli screenshot
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -96,7 +101,6 @@ def sync_user(user_data: UserSyncRequest):
         if not response: raise Exception("CRITICO: Risposta nulla dal database.")
         now = datetime.now(timezone.utc)
         if not response.data or len(response.data) == 0:
-            # Rimosso 'pending_points_balance' dalla creazione del nuovo utente
             new_user_record = {'user_id': user_data.user_id, 'email': user_data.email, 'display_name': user_data.displayName, 'referrer_id': user_data.referrer_id, 'avatar_url': user_data.avatar_url, 'login_streak': 1, 'last_login_at': now.isoformat(), 'points_balance': 0}
             supabase.table('users').insert(new_user_record).execute()
         else:
@@ -137,7 +141,6 @@ def get_user_balance(user_id: str):
         supabase = get_supabase_client()
         response = supabase.table('users').select('points_balance').eq('user_id', user_id).maybe_single().execute()
         if not response or not response.data: raise HTTPException(status_code=404, detail=f"Utente {user_id} non trovato.")
-        # Rimosso pending_points_balance e aggiunto un valore di default per sicurezza
         return {"points_balance": response.data.get('points_balance', 0), "pending_points_balance": 0}
     except HTTPException as http_exc: raise http_exc
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
