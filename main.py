@@ -1,4 +1,4 @@
-# main.py - Versione Finale, Stabile e Completa
+# main.py - Versione Temporanea per Test con Generazioni Gratuite Illimitate
 # Data: 2 Luglio 2025
 
 # --- Import delle librerie ---
@@ -74,13 +74,30 @@ class SubmissionRequest(BaseModel): contest_id: int; user_id: str; image_url: st
 
 # --- Funzioni Helper ---
 def get_supabase_client() -> Client: return create_client(SUPABASE_URL, SUPABASE_KEY)
-def generate_viral_plan(prompt: str) -> str:
+
+# La funzione generate_viral_plan è stata modificata per accettare is_paid_quality_level
+def generate_viral_plan(prompt: str, is_paid_quality_level: bool = False) -> str:
     try:
-        model = GenerativeModel("gemini-1.5-flash")
-        ai_prompt = f"Dato il seguente prompt creativo: '{prompt}', crea un piano marketing in 3 brevi punti per rendere virale un post basato su questo contenuto sui social media (come Instagram o TikTok). Sii conciso e d'impatto. Usa emoji."
+        model = GenerativeModel("gemini-1.5-flash") # Puoi usare un modello più potente qui se hai accesso, ad esempio gemini-1.5-pro
+        
+        if is_paid_quality_level:
+            ai_prompt = f"""Dato il seguente prompt creativo: '{prompt}', crea un piano marketing SUPER DETTAGLIATO in 5 punti specifici per rendere virale un post o contenuto basato su questo su piattaforme come Instagram e TikTok.
+            Per ogni punto, fornisci:
+            1. Una descrizione chiara dell'azione.
+            2. Suggerimenti concreti su come implementarla (es. tipi di video, descrizioni, orari).
+            3. Esempi di hashtag o suoni di tendenza rilevanti.
+            4. Usa un tono energico e persuasivo. Includi emoji per ogni punto.
+            """
+        else:
+            ai_prompt = f"Dato il seguente prompt creativo: '{prompt}', crea un piano marketing in 3 brevi punti per rendere virale un post basato su questo contenuto sui social media (come Instagram o TikTok). Sii conciso e d'impatto. Usa emoji."
+        
         return model.generate_content(ai_prompt).text.strip()
     except Exception as e:
-        print(f"Errore generazione piano virale: {e}"); return "1. Usa hashtag di tendenza. 2. Crea un video breve e d'impatto. 3. Interagisci con i commenti."
+        print(f"Errore generazione piano virale: {e}")
+        if is_paid_quality_level:
+            return "Errore nella generazione del piano dettagliato. Riprova più tardi."
+        else:
+            return "1. Usa hashtag di tendenza. 2. Crea un video breve e d'impatto. 3. Interagisci con i commenti."
 
 # --- Endpoint API ---
 
@@ -164,7 +181,7 @@ def get_streak_status(user_id: str):
 def claim_streak_bonus(user_id: str):
     try:
         status = get_streak_status(user_id)
-        if not status["canClaim"]: raise HTTPException(status_code=400, detail="Bonus già riscosso.")
+        if not status["canClaim"]: raise HTTPException(status_code=400, detail="Bonus giÃ  riscosso.")
         reward = min(status["days"] * 10, 100)
         supabase = get_supabase_client()
         supabase.rpc('add_points', {'user_id_in': user_id, 'points_to_add': reward}).execute()
@@ -219,6 +236,24 @@ def generate_ai_content(req: AIGenerationRequest):
     if not user_res.data: raise HTTPException(status_code=404, detail="Utente non trovato.")
     user = user_res.data
 
+    # --- INIZIO BLOCCO TEMPORANEO PER TEST: GENERAZIONI GRATUITE ---
+    # Questa sezione è stata modificata per rendere tutte le generazioni gratuite.
+    # Non verrà scalato alcun punto e non verrà richiesto Stripe.
+    # Verrà comunque aggiornato 'free_generations_used' per tracciare i tentativi di generazione,
+    # ma il costo sarà effettivo 0 punti.
+
+    cost_in_points = 0 # Costo impostato a zero per il test
+    
+    # Per il test, impostiamo sempre la qualità avanzata per vedere l'output dettagliato
+    is_paid_quality_level = True 
+
+    client_secret_for_frontend = None # Nessun client_secret richiesto per il test
+    # --- FINE BLOCCO TEMPORANEO PER TEST ---
+
+    # Il blocco seguente è stato bypassato per il testing delle generazioni gratuite.
+    # Riattivalo rimuovendo il blocco di commento (o ripristinando il main.py originale)
+    # quando hai finito di testare le generazioni gratuite.
+    """
     cost_in_points = IMAGE_GENERATION_POINTS_COST
     is_paid_generation = True
     if user.get('free_generations_used', 0) < 3:
@@ -239,6 +274,7 @@ def generate_ai_content(req: AIGenerationRequest):
     else: raise HTTPException(status_code=400, detail="Metodo di pagamento non valido.")
 
     if client_secret_for_frontend: return {"client_secret": client_secret_for_frontend, "payment_required": True}
+    """
 
     try:
         generated_url, generated_text = None, None
@@ -249,20 +285,28 @@ def generate_ai_content(req: AIGenerationRequest):
             generated_url = f"data:image/png;base64,{base64.b64encode(images[0]._image_bytes).decode('utf-8')}"
         elif req.content_type == 'POST':
             model = GenerativeModel("gemini-1.5-flash")
-            response = model.generate_content(f"Scrivi un breve e coinvolgente post per Instagram basato su questo concetto: '{req.prompt}'")
+            
+            # La qualità dell'output è controllata dal flag is_paid_quality_level
+            if is_paid_quality_level: # Questo sarà True con la modifica temporanea
+                post_prompt = f"Scrivi un post per social media (es. Instagram/TikTok) molto dettagliato e accattivante, lungo circa 150-200 parole, basato sul seguente concetto: '{req.prompt}'. Includi call-to-action e hashtag pertinenti. Usa uno stile persuasivo."
+            else:
+                post_prompt = f"Scrivi un breve e coinvolgente post per Instagram basato su questo concetto: '{req.prompt}'. Sii conciso e d'impatto."
+            
+            response = model.generate_content(post_prompt)
             generated_text = response.text.strip()
         elif req.content_type == 'VIDEO': raise HTTPException(status_code=501, detail="Generazione video non implementata.")
         
-        ai_strategy_plan = generate_viral_plan(req.prompt)
+        # Il piano virale utilizza la stessa logica di qualità
+        ai_strategy_plan = generate_viral_plan(req.prompt, is_paid_quality_level)
         new_content = {"user_id": req.user_id, "content_type": req.content_type, "prompt": req.prompt, "generated_url": generated_url, "generated_text": generated_text, "ai_strategy_plan": ai_strategy_plan, "status": "DRAFT", "contest_id": req.contest_id}
         insert_res = supabase.table("ai_content").insert(new_content, returning="representation").execute()
         
-        if not is_paid_generation:
-            supabase.table("users").update({"free_generations_used": user.get('free_generations_used', 0) + 1}).eq("user_id", req.user_id).execute()
+        # Incrementa il contatore delle generazioni usate, anche se sono gratuite per il test
+        supabase.table("users").update({"free_generations_used": user.get('free_generations_used', 0) + 1}).eq("user_id", req.user_id).execute()
         
         return insert_res.data[0]
     except Exception as e:
-        if req.payment_method == 'points': supabase.rpc('add_points', {'user_id_in': req.user_id, 'points_to_add': cost_in_points}).execute()
+        # Nessun ripristino di punti necessario, dato che non ne sono stati scalati
         raise HTTPException(status_code=500, detail=f"Errore generazione AI: {e}")
 
 @app.post("/ai/content/{content_id}/publish")
