@@ -1,5 +1,5 @@
 # main.py - Versione Finale, Stabile e Completa
-# Data: 1 Luglio 2025
+# Data: 2 Luglio 2025
 
 # --- Import delle librerie ---
 import os
@@ -96,7 +96,8 @@ def sync_user(user_data: UserSyncRequest):
         if not response: raise Exception("CRITICO: Risposta nulla dal database.")
         now = datetime.now(timezone.utc)
         if not response.data or len(response.data) == 0:
-            new_user_record = {'user_id': user_data.user_id, 'email': user_data.email, 'display_name': user_data.displayName, 'referrer_id': user_data.referrer_id, 'avatar_url': user_data.avatar_url, 'login_streak': 1, 'last_login_at': now.isoformat(), 'points_balance': 0, 'pending_points_balance': 0}
+            # Rimosso 'pending_points_balance' dalla creazione del nuovo utente
+            new_user_record = {'user_id': user_data.user_id, 'email': user_data.email, 'display_name': user_data.displayName, 'referrer_id': user_data.referrer_id, 'avatar_url': user_data.avatar_url, 'login_streak': 1, 'last_login_at': now.isoformat(), 'points_balance': 0}
             supabase.table('users').insert(new_user_record).execute()
         else:
             user = response.data[0]
@@ -125,7 +126,7 @@ def request_payout(payout_data: PayoutRequest):
         supabase = get_supabase_client()
         value_eur = payout_data.points_amount / POINTS_TO_EUR_RATE
         supabase.rpc('request_payout_function', { 'p_user_id': payout_data.user_id, 'p_points_amount': payout_data.points_amount, 'p_value_in_eur': value_eur, 'p_method': payout_data.method, 'p_address': payout_data.address }).execute()
-        return {"status": "success", "message": "La tua richiesta di prelievo è stata inviata!"}
+        return {"status": "success", "message": "La tua richiesta di prelievo Ã¨ stata inviata!"}
     except Exception as e:
         if 'Punti insufficienti' in str(e): raise HTTPException(status_code=402, detail="Punti prelevabili insufficienti.")
         print(f"Errore in request_payout: {e}"); raise HTTPException(status_code=500, detail="Errore durante la richiesta.")
@@ -134,9 +135,10 @@ def request_payout(payout_data: PayoutRequest):
 def get_user_balance(user_id: str):
     try:
         supabase = get_supabase_client()
-        response = supabase.table('users').select('points_balance, pending_points_balance').eq('user_id', user_id).maybe_single().execute()
+        response = supabase.table('users').select('points_balance').eq('user_id', user_id).maybe_single().execute()
         if not response or not response.data: raise HTTPException(status_code=404, detail=f"Utente {user_id} non trovato.")
-        return {"points_balance": response.data.get('points_balance', 0), "pending_points_balance": response.data.get('pending_points_balance', 0)}
+        # Rimosso pending_points_balance e aggiunto un valore di default per sicurezza
+        return {"points_balance": response.data.get('points_balance', 0), "pending_points_balance": 0}
     except HTTPException as http_exc: raise http_exc
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
@@ -156,7 +158,7 @@ def get_streak_status(user_id: str):
 def claim_streak_bonus(user_id: str):
     try:
         status_response = get_streak_status(user_id=user_id)
-        if not status_response.get("canClaim"): raise HTTPException(status_code=400, detail="Bonus giornaliero già riscosso.")
+        if not status_response.get("canClaim"): raise HTTPException(status_code=400, detail="Bonus giornaliero giÃ  riscosso.")
         reward = min(status_response.get("days", 0) * 10, 100)
         supabase = get_supabase_client()
         user_res = supabase.table('users').select('points_balance').eq('user_id', user_id).single().execute()
@@ -195,12 +197,17 @@ def get_current_contest():
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         response = supabase.table('ai_contests').select('*').gte('created_at', today_start.isoformat()).order('id', desc=True).limit(1).execute()
         if response.data: return response.data[0]
+        
         new_theme = generate_daily_theme()
         new_contest_data = {"theme_prompt": new_theme, "start_date": today_start.isoformat(), "end_date": (today_start + timedelta(days=1)).isoformat(), "status": "active", "prize_pool": 10000}
-        insert_response = supabase.table('ai_contests').insert(new_contest_data).execute(returning="representation")
+        
+        insert_response = supabase.table('ai_contests').insert(new_contest_data).execute()
+        
         if not insert_response.data: raise Exception("Fallimento nel recuperare il contest appena creato.")
         return insert_response.data[0]
-    except Exception as e: print(f"Errore in get_current_contest: {e}"); raise HTTPException(status_code=500, detail="Impossibile caricare il contest.")
+    except Exception as e:
+        print(f"Errore in get_current_contest: {e}")
+        raise HTTPException(status_code=500, detail="Impossibile caricare il contest.")
 
 @app.post("/contests/generate_image")
 def generate_ai_image(req: ImageGenerationRequest):
