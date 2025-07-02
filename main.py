@@ -22,7 +22,6 @@ STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
 PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
-PAYPAL_WEBHOOK_ID = os.environ.get("PAYPAL_WEBHOOK_ID")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
@@ -65,6 +64,7 @@ app.add_middleware(
 
 # --- Modelli Dati (Pydantic) ---
 IMAGE_GENERATION_COST = 50
+IMAGE_GENERATION_EUR_PRICE = 0.50
 POINTS_TO_EUR_RATE = 1000.0
 
 class UserSyncRequest(BaseModel): user_id: str; email: str | None = None; displayName: str | None = None; referrer_id: str | None = None; avatar_url: str | None = None
@@ -94,12 +94,12 @@ def sync_user(user_data: UserSyncRequest):
     supabase = get_supabase_client()
     now = datetime.now(timezone.utc)
     try:
-        response = supabase.table('users').select('user_id, last_login_at, login_streak').eq('user_id', user_data.user_id).execute()
+        response = supabase.table('users').select('user_id, last_login_at, login_streak').eq('user_id', user_data.user_id).single().execute()
         if not response.data:
             new_user_record = {'user_id': user_data.user_id, 'email': user_data.email, 'display_name': user_data.displayName, 'referrer_id': user_data.referrer_id, 'avatar_url': user_data.avatar_url, 'login_streak': 1, 'last_login_at': now.isoformat(), 'points_balance': 0}
             supabase.table('users').insert(new_user_record).execute()
         else:
-            user = response.data[0]
+            user = response.data
             last_login_str, new_streak = user.get('last_login_at'), user.get('login_streak', 1)
             if last_login_str:
                 days_diff = (now.date() - datetime.fromisoformat(last_login_str).date()).days
@@ -160,7 +160,7 @@ def get_streak_status(user_id: str):
     try:
         supabase = get_supabase_client()
         response = supabase.table('users').select('login_streak, last_streak_claim_at').eq('user_id', user_id).maybe_single().execute()
-        if not response.data: return {"days": 0, "canClaim": False}
+        if not response.data: return {"days": 0, "canClaim": True}
         user, can_claim = response.data, True
         if user.get('last_streak_claim_at'):
             if datetime.fromisoformat(user['last_streak_claim_at']).date() == datetime.now(timezone.utc).date(): can_claim = False
@@ -192,8 +192,32 @@ def get_shop_items():
 
 @app.post("/shop/buy")
 def buy_shop_item(req: PurchaseRequest):
-    #... (Logica già completa dalla risposta precedente) ...
-    pass
+    supabase = get_supabase_client()
+    try:
+        item_res = supabase.table("shop_items").select("price, price_eur, name").eq("id", req.item_id).single().execute()
+        if not item_res.data: raise HTTPException(status_code=404, detail="Articolo non trovato.")
+        item = item_res.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore nel recuperare l'articolo: {e}")
+
+    if req.payment_method == 'points':
+        try:
+            supabase.rpc('purchase_item', {'p_user_id': req.user_id, 'p_item_id': req.item_id}).execute()
+            return {"status": "success", "message": "Acquisto completato con i tuoi Zenith Coins!"}
+        except Exception as e:
+            if 'Fondi insufficienti' in str(e): raise HTTPException(status_code=402, detail="Zenith Coins insufficienti.")
+            raise HTTPException(status_code=500, detail="Errore durante l'acquisto con punti.")
+    elif req.payment_method == 'stripe':
+        try:
+            price_in_eur = item.get("price_eur")
+            if price_in_eur is None: raise HTTPException(status_code=400, detail="Prezzo in EUR non disponibile.")
+            price_in_cents = int(price_in_eur * 100)
+            payment_intent = stripe.PaymentIntent.create(amount=price_in_cents, currency="eur", automatic_payment_methods={"enabled": True}, metadata={'user_id': req.user_id, 'item_id': req.item_id})
+            return {"client_secret": payment_intent.client_secret}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Errore Stripe: {e}")
+    else:
+        raise HTTPException(status_code=400, detail="Metodo di pagamento non valido.")
 
 @app.get("/contests/current")
 def get_current_contest():
@@ -216,16 +240,16 @@ def generate_ai_image(req: ImageGenerationRequest):
         if user_res.data.get('points_balance', 0) < IMAGE_GENERATION_COST: raise HTTPException(status_code=402, detail="Zenith Coins insufficienti.")
         supabase.rpc('add_points', {'user_id_in': req.user_id, 'points_to_add': -IMAGE_GENERATION_COST}).execute()
     elif req.payment_method == 'stripe':
-        price_in_cents = int(0.5 * 100) # Esempio: 0.50 EUR per una generazione
+        price_in_cents = int(IMAGE_GENERATION_EUR_PRICE * 100)
         try:
-            payment_intent = stripe.PaymentIntent.create(amount=price_in_cents, currency="eur", automatic_payment_methods={"enabled": True})
+            payment_intent = stripe.PaymentIntent.create(amount=price_in_cents, currency="eur", automatic_payment_methods={"enabled": True}, metadata={'user_id': req.user_id, 'item_id': 'image_generation'})
             return {"client_secret": payment_intent.client_secret, "payment_required": True}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Errore Stripe: {e}")
     else:
         raise HTTPException(status_code=400, detail="Metodo di pagamento non valido.")
     
-    # Se il pagamento (con punti) è andato a buon fine, genera l'immagine
+    # Se il pagamento è andato a buon fine, genera l'immagine
     try:
         model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-002")
         images = model.generate_images(prompt=req.prompt, number_of_images=1, aspect_ratio="1:1")
@@ -233,8 +257,8 @@ def generate_ai_image(req: ImageGenerationRequest):
         return {"image_url": f"data:image/png;base64,{base64_image}", "payment_required": False}
     except Exception as e:
         print(f"Errore in generate_image AI: {e}")
-        # Rimborsa i punti se la generazione AI fallisce
-        supabase.rpc('add_points', {'user_id_in': req.user_id, 'points_to_add': IMAGE_GENERATION_COST}).execute()
+        if req.payment_method == 'points':
+            supabase.rpc('add_points', {'user_id_in': req.user_id, 'points_to_add': IMAGE_GENERATION_COST}).execute()
         raise HTTPException(status_code=500, detail="Errore durante la generazione dell'immagine.")
 
 @app.get("/contests/{contest_id}/submissions")
@@ -256,8 +280,30 @@ def get_referral_stats(user_id: str):
 
 @app.post("/stripe-webhook")
 async def stripe_webhook(request: Request):
-    # ... (Logica webhook invariata) ...
-    pass
+    payload = await request.body()
+    sig_header = request.headers.get('stripe-signature')
+    try:
+        event = stripe.Webhook.construct_event(payload=payload, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Errore webhook: {e}")
+    if event['type'] == 'payment_intent.succeeded':
+        payment_intent = event['data']['object']
+        metadata = payment_intent.get('metadata')
+        if metadata:
+            user_id = metadata.get('user_id')
+            item_id_str = metadata.get('item_id')
+            if item_id_str == 'image_generation':
+                print(f"Pagamento Stripe per generazione immagine ricevuto per utente {user_id}")
+                # La generazione è già avvenuta nel frontend, qui potremmo solo registrarla se necessario
+            elif user_id and item_id_str:
+                print(f"Pagamento Stripe per articolo {item_id_str} ricevuto per utente {user_id}")
+                try:
+                    supabase = get_supabase_client()
+                    supabase.rpc('purchase_item', {'p_user_id': user_id, 'p_item_id': int(item_id_str)}).execute()
+                    print("Articolo consegnato con successo!")
+                except Exception as e:
+                    print(f"ERRORE CRITICO: Impossibile consegnare l'articolo {item_id_str} all'utente {user_id} dopo il pagamento. Errore: {e}")
+    return {"status": "success"}
 
 @app.get("/missions/{user_id}")
 def get_missions(user_id: str): raise HTTPException(status_code=501, detail="Non implementato.")
