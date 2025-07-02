@@ -69,7 +69,8 @@ class SubmissionRequest(BaseModel):
 class PurchaseRequest(BaseModel):
     user_id: str; item_id: int
 class UserProfileUpdate(BaseModel):
-    displayName: str | None = None; avatar_url: str | None = None
+    display_name: str | None = None # Modificato in snake_case
+    avatar_url: str | None = None
 
 # --- Funzioni Helper ---
 def get_supabase_client() -> Client:
