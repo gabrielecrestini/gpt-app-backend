@@ -162,21 +162,55 @@ def get_leaderboard():
 
 @app.post("/ai/generate-advice")
 def generate_advice(req: AIAdviceRequest):
-    if not vertexai: raise HTTPException(status_code=503, detail="AI service is not available.")
+    if not vertexai:
+        raise HTTPException(status_code=503, detail="AI service is not available.")
+
     supabase = get_supabase_client()
-    user_res = supabase.table('users').select('subscription_plan').eq('user_id', req.user_id).maybe_single().execute()
-    if not user_res.data: raise HTTPException(status_code=404, detail="User not found.")
+    now = datetime.now(timezone.utc)
+
+    # 1. Recupera i dati dell'utente, inclusi i limiti di generazione
+    user_res = supabase.table('users').select(
+        'subscription_plan, daily_ai_generations_used, last_generation_reset_date'
+    ).eq('user_id', req.user_id).maybe_single().execute()
+
+    if not user_res.data:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    user = user_res.data
+    user_plan = user.get('subscription_plan', 'free')
+    generations_used = user.get('daily_ai_generations_used', 0)
+    last_reset_str = user.get('last_generation_reset_date')
     
-    user_plan = user_res.data.get('subscription_plan', 'free')
+    # 2. Controlla se è un nuovo giorno per resettare il contatore
+    if last_reset_str and datetime.fromisoformat(last_reset_str).date() < now.date():
+        generations_used = 0
+        supabase.table('users').update({
+            'daily_ai_generations_used': 0,
+            'last_generation_reset_date': now.isoformat()
+        }).eq('user_id', req.user_id).execute()
+
+    # 3. Definisci i limiti per ogni piano e controlla se l'utente può generare
+    plan_limits = {'free': 3, 'premium': 15, 'assistant': 100} # Esempio di limiti
+    
+    if generations_used >= plan_limits.get(user_plan, 3):
+        raise HTTPException(status_code=429, detail="Hai raggiunto il limite di generazioni AI giornaliere per il tuo piano.")
+
+    # 4. Costruisci il prompt in base al piano (come prima)
     final_prompt = f"Given the goal '{req.prompt}', provide 3 brief, impactful tips."
     if user_plan == 'assistant':
         final_prompt = f"Act as a world-class business mentor. Given the goal '{req.prompt}', create a detailed step-by-step strategy."
     elif user_plan == 'premium':
         final_prompt = f"Given the goal '{req.prompt}', create a 5-7 point action plan with practical examples."
-    
+
     try:
+        # 5. Genera la risposta e aggiorna il contatore
         model = GenerativeModel("gemini-1.5-flash")
         response = model.generate_content(final_prompt)
+        
+        supabase.table('users').update({
+            'daily_ai_generations_used': generations_used + 1
+        }).eq('user_id', req.user_id).execute()
+        
         return {"advice": response.text.strip()}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"AI service error: {e}")
