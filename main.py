@@ -34,7 +34,21 @@ STRIPE_PRICE_ID_ASSISTANT = os.environ.get("STRIPE_PRICE_ID_ASSISTANT")
 
 # --- Inizializzazione dei Servizi ---
 app = FastAPI(title="Zenith Rewards Backend", description="API per la gestione dell'app Zenith Rewards.")
+from fastapi.middleware.cors import CORSMiddleware
 
+# Allowed origins
+origins = [
+    "https://cashhh-52f38.web.app",
+    "http://localhost:3000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"], # Allows all methods
+    allow_headers=["*"], # Allows all headers
+)
 vertexai = None
 if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
     try:
