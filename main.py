@@ -2,11 +2,13 @@ import os
 from datetime import datetime, timezone
 import json
 from enum import Enum
-from typing import Literal # Importazione aggiunta
+from typing import Literal, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
+from supabase.lib.client_options import ClientOptions
+from postgrest.exceptions import APIError as PostgrestAPIError # Import specifico per errori API Supabase
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 import stripe
@@ -32,6 +34,11 @@ gemini_flash_model = None
 gemini_pro_vision_model = None
 vertexai_initialized = False
 
+# Configura il logging
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
     try:
         sa_key_path = "gcp_sa_key.json"
@@ -43,15 +50,17 @@ if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
         gemini_flash_model = GenerativeModel("gemini-1.5-flash")
         gemini_pro_vision_model = GenerativeModel("gemini-pro-vision")
         vertexai_initialized = True
+        logger.info("Vertex AI initialized successfully.")
     except Exception as e:
-        print(f"WARNING: Vertex AI configuration error: {e}. AI functionalities might be limited or unavailable.")
+        logger.error(f"WARNING: Vertex AI configuration error: {e}. AI functionalities might be limited or unavailable.")
 else:
-    print("WARNING: Missing GCP credentials. Vertex AI is disabled.")
+    logger.warning("WARNING: Missing GCP credentials. Vertex AI is disabled.")
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
+    logger.info("Stripe API key loaded.")
 else:
-    print("WARNING: STRIPE_SECRET_KEY not configured. Stripe functionalities are disabled.")
+    logger.warning("WARNING: STRIPE_SECRET_KEY not configured. Stripe functionalities are disabled.")
 
 FRONTEND_URL = os.environ.get("NEXT_PUBLIC_FRONTEND_URL", "https://cashhh-52f38.web.app")
 
@@ -112,7 +121,7 @@ class AIGenerationRequest(BaseModel):
     user_id: str
     prompt: str
     content_type: ContentType
-    payment_method: Literal['points', 'stripe'] # Modifica applicata qui
+    payment_method: Literal['points', 'stripe']
     contest_id: int | None = None
 
 class VoteContentRequest(BaseModel):
@@ -127,21 +136,46 @@ class CreateSubscriptionRequest(BaseModel):
 class ShopBuyRequest(BaseModel):
     user_id: str
     item_id: int
-    payment_method: Literal['points', 'stripe'] # Potrebbe essere utile anche qui
+    payment_method: Literal['points', 'stripe']
 
 def get_supabase_client() -> Client:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise HTTPException(status_code=500, detail="Supabase credentials not configured.")
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+    try:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise ValueError("Supabase credentials not configured.")
+        # Utilizza ClientOptions per una gestione più robusta dei timeout o retry
+        options = ClientOptions(postgrest_client_timeout=10, storage_client_timeout=10)
+        return create_client(SUPABASE_URL, SUPABASE_KEY, options=options)
+    except Exception as e:
+        logger.critical(f"Failed to create Supabase client: {e}")
+        raise HTTPException(status_code=500, detail=f"Supabase client initialization failed: {e}")
 
 class UserManager:
     def __init__(self, supabase: Client): self.supabase = supabase
 
+    def _execute_supabase_query(self, query_builder, error_message: str) -> Any:
+        try:
+            result = query_builder.execute()
+            if hasattr(result, 'data'):
+                return result.data
+            return result # For RPC calls that might return something else directly
+        except PostgrestAPIError as e:
+            logger.error(f"Supabase API Error in UserManager: {error_message} - {e.code}: {e.message} - {e.details}")
+            raise HTTPException(status_code=400, detail=f"Database error: {e.message}. Hint: {e.details}")
+        except Exception as e:
+            logger.error(f"Unexpected error in UserManager: {error_message} - {e}")
+            raise HTTPException(status_code=500, detail=f"Internal server error during {error_message}.")
+
     def sync_user(self, user_data: UserSyncRequest):
         now = datetime.now(timezone.utc)
-        response = self.supabase.table('users').select('user_id, last_login_at, login_streak, daily_ai_generations_used, last_generation_reset_date, daily_votes_used, last_vote_reset_date').eq('user_id', user_data.user_id).maybe_single().execute()
+        logger.info(f"Attempting to sync user: {user_data.user_id}")
         
-        if not response.data:
+        user_record = self._execute_supabase_query(
+            self.supabase.table('users').select('user_id, last_login_at, login_streak, daily_ai_generations_used, last_generation_reset_date, daily_votes_used, last_vote_reset_date').eq('user_id', user_data.user_id).maybe_single(),
+            "user sync fetch"
+        )
+        
+        if not user_record:
+            logger.info(f"Creating new user: {user_data.user_id}")
             new_user_record = {
                 'user_id': user_data.user_id,
                 'email': user_data.email,
@@ -158,12 +192,17 @@ class UserManager:
                 'daily_votes_used': 0,
                 'last_vote_reset_date': now.isoformat()
             }
-            self.supabase.table('users').insert(new_user_record).execute()
+            self._execute_supabase_query(
+                self.supabase.table('users').insert(new_user_record),
+                "insert new user"
+            )
+            logger.info(f"New user {user_data.user_id} created successfully.")
         else:
-            user = response.data
-            last_login_str = user.get('last_login_at')
-            current_streak = user.get('login_streak', 0)
+            logger.info(f"Updating existing user: {user_data.user_id}")
+            last_login_str = user_record.get('last_login_at')
+            current_streak = user_record.get('login_streak', 0)
             
+            new_streak = 1 # Default a 1 se la streak è interrotta o non c'era un login precedente
             if last_login_str:
                 last_login_date = datetime.fromisoformat(last_login_str).date()
                 today = now.date()
@@ -171,44 +210,65 @@ class UserManager:
 
                 if days_diff == 1:
                     new_streak = current_streak + 1
-                elif days_diff > 1:
-                    new_streak = 1
-                else:
+                elif days_diff == 0: # Già loggato oggi, non resettare la streak
                     new_streak = current_streak
-            else:
-                new_streak = 1
-
-            update_data = {'last_login_at': now.isoformat(), 'login_streak': new_streak}
             
-            last_gen_reset_date = datetime.fromisoformat(user.get('last_generation_reset_date', now.isoformat())).date()
+            update_data: Dict[str, Any] = {'last_login_at': now.isoformat(), 'login_streak': new_streak}
+            
+            last_gen_reset_date_str = user_record.get('last_generation_reset_date')
+            last_gen_reset_date = datetime.fromisoformat(last_gen_reset_date_str).date() if last_gen_reset_date_str else now.date()
             if now.date() > last_gen_reset_date:
                 update_data['daily_ai_generations_used'] = 0
                 update_data['last_generation_reset_date'] = now.isoformat()
             
-            last_vote_reset_date = datetime.fromisoformat(user.get('last_vote_reset_date', now.isoformat())).date()
+            last_vote_reset_date_str = user_record.get('last_vote_reset_date')
+            last_vote_reset_date = datetime.fromisoformat(last_vote_reset_date_str).date() if last_vote_reset_date_str else now.date()
             if now.date() > last_vote_reset_date:
                 update_data['daily_votes_used'] = 0
                 update_data['last_vote_reset_date'] = now.isoformat()
 
-            self.supabase.table('users').update(update_data).eq('user_id', user_data.user_id).execute()
+            self._execute_supabase_query(
+                self.supabase.table('users').update(update_data).eq('user_id', user_data.user_id),
+                "update existing user"
+            )
+            logger.info(f"User {user_data.user_id} updated successfully.")
         return {"status": "success"}
 
     def update_profile(self, user_id: str, profile_data: UserProfileUpdate):
+        logger.info(f"Updating profile for user: {user_id}")
         update_payload = profile_data.model_dump(exclude_unset=True)
-        if not update_payload: raise HTTPException(status_code=400, detail="No data provided to update.")
-        self.supabase.table('users').update(update_payload).eq('user_id', user_id).execute()
+        if not update_payload: 
+            logger.warning(f"No data provided for profile update for user {user_id}")
+            raise HTTPException(status_code=400, detail="No data provided to update.")
+        
+        self._execute_supabase_query(
+            self.supabase.table('users').update(update_payload).eq('user_id', user_id),
+            "update user profile"
+        )
+        logger.info(f"Profile for user {user_id} updated successfully.")
         return {"status": "success", "message": "Profile updated successfully."}
 
     def get_user_balance(self, user_id: str):
-        response = self.supabase.table('users').select('points_balance, pending_points_balance').eq('user_id', user_id).maybe_single().execute()
-        if not response.data: raise HTTPException(status_code=404, detail="User not found")
-        return response.data
+        logger.info(f"Fetching balance for user: {user_id}")
+        response_data = self._execute_supabase_query(
+            self.supabase.table('users').select('points_balance, pending_points_balance').eq('user_id', user_id).maybe_single(),
+            "fetch user balance"
+        )
+        if not response_data:
+            logger.warning(f"User {user_id} not found when fetching balance.")
+            raise HTTPException(status_code=404, detail="User not found.")
+        return response_data
 
     def get_user_profile(self, user_id: str):
-        response = self.supabase.table('users').select(
-            'subscription_plan, daily_ai_generations_used, last_generation_reset_date, daily_votes_used, last_vote_reset_date, points_balance'
-        ).eq('user_id', user_id).maybe_single().execute()
-        if not response.data:
+        logger.info(f"Fetching profile for user: {user_id}")
+        response_data = self._execute_supabase_query(
+            self.supabase.table('users').select(
+                'subscription_plan, daily_ai_generations_used, last_generation_reset_date, daily_votes_used, last_vote_reset_date, points_balance'
+            ).eq('user_id', user_id).maybe_single(),
+            "fetch user profile"
+        )
+        if not response_data:
+            logger.warning(f"User {user_id} not found when fetching profile. Returning default data.")
             return {
                 "subscription_plan": SubscriptionPlan.FREE.value,
                 "daily_ai_generations_used": 0,
@@ -217,26 +277,43 @@ class UserManager:
                 "last_vote_reset_date": datetime.now(timezone.utc).isoformat(),
                 "points_balance": 0
             }
-        return response.data
+        return response_data
 
     def get_streak_status(self, user_id: str):
-        response = self.supabase.table('users').select('login_streak').eq('user_id', user_id).maybe_single().execute()
-        if not response.data: return {"login_streak": 0}
-        return response.data
+        logger.info(f"Fetching streak status for user: {user_id}")
+        response_data = self._execute_supabase_query(
+            self.supabase.table('users').select('login_streak').eq('user_id', user_id).maybe_single(),
+            "fetch streak status"
+        )
+        if not response_data: 
+            logger.warning(f"User {user_id} not found when fetching streak. Returning 0.")
+            return {"login_streak": 0}
+        return response_data
 
     def claim_streak_reward(self, user_id: str):
-        try:
-            result = self.supabase.rpc('claim_streak_reward', {'p_user_id': user_id}).execute()
-            if result.data and isinstance(result.data, list) and len(result.data) > 0:
-                return result.data[0]
-            raise HTTPException(status_code=400, detail="Failed to claim streak reward. Check database function logs.")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error claiming streak: {e}")
+        logger.info(f"Attempting to claim streak reward for user: {user_id}")
+        result_data = self._execute_supabase_query(
+            self.supabase.rpc('claim_streak_reward', {'p_user_id': user_id}),
+            "claim streak RPC"
+        )
+        # result_data from RPC is usually a list of dicts or single dict
+        if result_data and isinstance(result_data, list) and len(result_data) > 0:
+            return result_data[0]
+        elif result_data and isinstance(result_data, dict):
+             return result_data
+        logger.error(f"Unexpected RPC return for claim_streak_reward for user {user_id}: {result_data}")
+        raise HTTPException(status_code=400, detail="Failed to claim streak reward. Check database function logs for details.")
 
     def get_referral_stats(self, user_id: str):
-        referral_count_res = self.supabase.table('users').select('count').eq('referrer_id', user_id).maybe_single().execute()
-        referral_count = referral_count_res.data['count'] if referral_count_res.data else 0
+        logger.info(f"Fetching referral stats for user: {user_id}")
+        referral_count_res = self._execute_supabase_query(
+            self.supabase.table('users').select('count').eq('referrer_id', user_id).maybe_single(),
+            "fetch referral count"
+        )
+        referral_count = referral_count_res['count'] if referral_count_res else 0
+
         referral_earnings = referral_count * 100
+        logger.info(f"Referral stats for {user_id}: count={referral_count}, earnings={referral_earnings}")
         return {"referral_count": referral_count, "referral_earnings": referral_earnings}
 
 class AIManager:
@@ -264,6 +341,7 @@ class AIManager:
 
     async def generate_advice(self, req: AIAdviceRequest):
         if not vertexai_initialized or not gemini_flash_model:
+            logger.error("AI service (Gemini Flash) is not available.")
             raise HTTPException(status_code=503, detail="AI service (Gemini Flash) is not available or not initialized.")
 
         user_profile = UserManager(self.supabase).get_user_profile(req.user_id)
@@ -273,12 +351,16 @@ class AIManager:
         
         if datetime.fromisoformat(last_reset_str).date() < datetime.now(timezone.utc).date():
             generations_used = 0
-            self.supabase.table('users').update({
-                'daily_ai_generations_used': 0,
-                'last_generation_reset_date': datetime.now(timezone.utc).isoformat()
-            }).eq('user_id', req.user_id).execute()
+            UserManager(self.supabase)._execute_supabase_query(
+                self.supabase.table('users').update({
+                    'daily_ai_generations_used': 0,
+                    'last_generation_reset_date': datetime.now(timezone.utc).isoformat()
+                }).eq('user_id', req.user_id),
+                "reset daily AI generations"
+            )
 
         if generations_used >= self.AI_GENERATION_LIMITS.get(user_plan, 0):
+            logger.warning(f"User {req.user_id} exceeded AI generation limit for plan {user_plan.value}")
             raise HTTPException(status_code=429, detail=f"Hai raggiunto il limite di generazioni AI giornaliere ({self.AI_GENERATION_LIMITS.get(user_plan, 0)}) per il tuo piano '{user_plan.value}'. Effettua l'upgrade per più generazioni!")
 
         final_prompt = f"Data l'idea o l'obiettivo '{req.prompt}', fornisci 3 consigli brevi e di impatto per il successo."
@@ -288,19 +370,25 @@ class AIManager:
             final_prompt = f"Sei un mentore aziendale di livello mondiale e un esperto di marketing digitale, dropshipping, trading e social media. Data l'idea o l'obiettivo '{req.prompt}', crea una strategia passo-passo estremamente dettagliata e personalizzata, includendo tattiche specifiche per scalare sia i social della piattaforma Zenith Rewards che i social esterni, suggerimenti per il dropshipping, il trading e l'e-commerce, e un piano di viralità completo. La tua risposta deve essere completa, azionabile e coprire tutte le sfaccettature richieste."
         
         try:
+            logger.info(f"Generating AI advice for user {req.user_id} with prompt: {req.prompt[:50]}...")
             response_ai = gemini_flash_model.generate_content(final_prompt)
             generated_text = response_ai.text.strip()
 
-            self.supabase.table('users').update({
-                'daily_ai_generations_used': generations_used + 1
-            }).eq('user_id', req.user_id).execute()
-            
+            UserManager(self.supabase)._execute_supabase_query(
+                self.supabase.table('users').update({
+                    'daily_ai_generations_used': generations_used + 1
+                }).eq('user_id', req.user_id),
+                "increment daily AI generations"
+            )
+            logger.info(f"AI advice generated and usage incremented for user {req.user_id}.")
             return {"advice": generated_text}
         except Exception as e:
+            logger.error(f"Error during AI advice generation for user {req.user_id}: {e}")
             raise HTTPException(status_code=503, detail=f"Errore del servizio AI: {e}. Riprova più tardi.")
 
     async def generate_content(self, req: AIGenerationRequest):
         if not vertexai_initialized:
+            logger.error("AI service is not available for content generation.")
             raise HTTPException(status_code=503, detail="AI service is not available.")
 
         user_profile = UserManager(self.supabase).get_user_profile(req.user_id)
@@ -310,6 +398,7 @@ class AIManager:
         
         if req.payment_method == 'points':
             if user_profile['points_balance'] < cost['points']:
+                logger.warning(f"User {req.user_id} has insufficient points ({user_profile['points_balance']}) for AI content generation (needed {cost['points']}).")
                 raise HTTPException(status_code=402, detail=f"Punti insufficienti. Hai bisogno di {cost['points']} ZC.")
         elif req.payment_method == 'stripe':
             pass
@@ -319,6 +408,7 @@ class AIManager:
         ai_strategy_plan = f"Piano base per la viralità: Condividi la tua creazione sui social media di Zenith Rewards e incoraggia i tuoi amici a votare! Per strategie avanzate, considera l'upgrade al piano Premium o Assistant."
 
         try:
+            logger.info(f"Generating AI content ({req.content_type.value}) for user {req.user_id} with prompt: {req.prompt[:50]}...")
             if req.content_type == ContentType.IMAGE:
                 if not gemini_pro_vision_model:
                      raise HTTPException(status_code=503, detail="AI image generation model not available.")
@@ -331,7 +421,7 @@ class AIManager:
                 generated_text = response_ai.text.strip()
             
             elif req.content_type == ContentType.VIDEO:
-                response_ai = gemini_flash_model.generate_content(f"Genera una breve sceneggiatura o un'idea per un video di 15-30 secondi basato su: '{req.prompt}'.")
+                response_ai = gemini_flash_model.generate_content(f"Genera una breve sceneggiatura o un'idea per un video di 15-30 secondi basata su: '{req.prompt}'.")
                 generated_text = f"Sceneggiatura video generata: {response_ai.text.strip()}\n(Simulazione: L'API reale genererebbe un URL video.)"
                 generated_url = "https://www.w3schools.com/html/mov_bbb.mp4"
 
@@ -353,21 +443,33 @@ class AIManager:
                 'is_published': False,
                 'votes': 0
             }
-            content_res = self.supabase.table('ai_contents').insert(insert_data).execute()
-            ai_content_id = content_res.data[0]['id']
+            content_res = UserManager(self.supabase)._execute_supabase_query(
+                self.supabase.table('ai_contents').insert(insert_data),
+                "insert AI content"
+            )
+            ai_content_id = content_res[0]['id'] if content_res else None
+            
+            if not ai_content_id:
+                raise Exception("Failed to retrieve ID of generated AI content.")
 
             if req.payment_method == 'points':
-                self.supabase.rpc('deduct_points', {
-                    'p_user_id': req.user_id,
-                    'p_amount': cost['points'],
-                    'p_reason': f'AI Generation - {req.content_type.value}'
-                }).execute()
+                UserManager(self.supabase)._execute_supabase_query(
+                    self.supabase.rpc('deduct_points', {
+                        'p_user_id': req.user_id,
+                        'p_amount': cost['points'],
+                        'p_reason': f'AI Generation - {req.content_type.value}'
+                    }),
+                    "deduct points for AI generation"
+                )
             
-            self.supabase.table('users').update({
-                'daily_ai_generations_used': user_profile['daily_ai_generations_used'] + 1,
-                'last_content_generated_id': ai_content_id
-            }).eq('user_id', req.user_id).execute()
-
+            UserManager(self.supabase)._execute_supabase_query(
+                self.supabase.table('users').update({
+                    'daily_ai_generations_used': user_profile['daily_ai_generations_used'] + 1,
+                    'last_content_generated_id': ai_content_id
+                }).eq('user_id', req.user_id),
+                "increment AI generations usage"
+            )
+            logger.info(f"AI content generated and usage incremented for user {req.user_id}. Content ID: {ai_content_id}")
             return {
                 "id": ai_content_id,
                 "prompt": req.prompt,
@@ -378,40 +480,56 @@ class AIManager:
                 "payment_required": False
             }
 
-        except Exception as e:
-            if "Punti insufficienti" in str(e):
+        except PostgrestAPIError as e:
+            logger.error(f"Supabase API Error during AI content generation: {e.code}: {e.message} - {e.details}")
+            if "Punti insufficienti" in e.message: # Custom message from RPC
                 raise HTTPException(status_code=402, detail="Punti insufficienti per la generazione AI.")
-            raise HTTPException(status_code=500, detail=f"Errore durante la generazione AI: {e}")
+            raise HTTPException(status_code=400, detail=f"Database error during AI generation: {e.message}. Hint: {e.details}")
+        except Exception as e:
+            logger.error(f"Unexpected error during AI content generation for user {req.user_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"Errore durante la generazione AI: {e}. Riprova più tardi.")
 
     def publish_ai_content(self, ai_content_id: int):
-        self.supabase.table('ai_contents').update({'is_published': True}).eq('id', ai_content_id).execute()
+        logger.info(f"Publishing AI content: {ai_content_id}")
+        UserManager(self.supabase)._execute_supabase_query(
+            self.supabase.table('ai_contents').update({'is_published': True}).eq('id', ai_content_id),
+            "publish AI content"
+        )
+        logger.info(f"AI content {ai_content_id} published successfully.")
         return {"status": "success", "message": "Content published successfully."}
 
     async def get_feed(self):
-        response = self.supabase.table('ai_contents').select(
-            'id, user_id, contest_id, prompt, content_type, generated_url, generated_text, ai_strategy_plan, votes, created_at, users(display_name, avatar_url)'
-        ).eq('is_published', True).order('votes', desc=True).order('created_at', desc=True).limit(50).execute()
+        logger.info("Fetching AI content feed.")
+        response = UserManager(self.supabase)._execute_supabase_query(
+            self.supabase.table('ai_contents').select(
+                'id, user_id, contest_id, prompt, content_type, generated_url, generated_text, ai_strategy_plan, votes, created_at, users(display_name, avatar_url)'
+            ).eq('is_published', True).order('votes', desc=True).order('created_at', desc=True).limit(50),
+            "fetch AI content feed"
+        )
         
         formatted_feed = []
-        for item in response.data:
-            formatted_feed.append({
-                "id": item['id'],
-                "user_id": item['user_id'],
-                "contest_id": item['contest_id'],
-                "prompt": item['prompt'],
-                "content_type": item['content_type'],
-                "generated_url": item['generated_url'],
-                "generated_text": item['generated_text'],
-                "ai_strategy_plan": item['ai_strategy_plan'],
-                "votes": item['votes'],
-                "user": {
-                    "display_name": item['users']['display_name'],
-                    "avatar_url": item['users']['avatar_url']
-                }
-            })
+        if response:
+            for item in response:
+                formatted_feed.append({
+                    "id": item['id'],
+                    "user_id": item['user_id'],
+                    "contest_id": item['contest_id'],
+                    "prompt": item['prompt'],
+                    "content_type": item['content_type'],
+                    "generated_url": item['generated_url'],
+                    "generated_text": item['generated_text'],
+                    "ai_strategy_plan": item['ai_strategy_plan'],
+                    "votes": item['votes'],
+                    "user": {
+                        "display_name": item['users']['display_name'],
+                        "avatar_url": item['users']['avatar_url']
+                    }
+                })
+        logger.info(f"Fetched {len(formatted_feed)} items for AI content feed.")
         return formatted_feed
 
     async def vote_content(self, content_id: int, user_id: str):
+        logger.info(f"User {user_id} attempting to vote for content {content_id}.")
         user_profile = UserManager(self.supabase).get_user_profile(user_id)
         user_plan = SubscriptionPlan(user_profile.get('subscription_plan', SubscriptionPlan.FREE.value))
         daily_votes_used = user_profile.get('daily_votes_used', 0)
@@ -419,29 +537,50 @@ class AIManager:
 
         if datetime.fromisoformat(last_vote_reset_date).date() < datetime.now(timezone.utc).date():
             daily_votes_used = 0
-            self.supabase.table('users').update({
-                'daily_votes_used': 0,
-                'last_vote_reset_date': datetime.now(timezone.utc).isoformat()
-            }).eq('user_id', user_id).execute()
+            UserManager(self.supabase)._execute_supabase_query(
+                self.supabase.table('users').update({
+                    'daily_votes_used': 0,
+                    'last_vote_reset_date': datetime.now(timezone.utc).isoformat()
+                }).eq('user_id', user_id),
+                "reset daily votes"
+            )
 
         if daily_votes_used >= self.DAILY_VOTE_LIMITS.get(user_plan, 0):
+            logger.warning(f"User {user_id} exceeded daily vote limit for plan {user_plan.value}.")
             raise HTTPException(status_code=429, detail=f"Hai raggiunto il limite giornaliero di voti ({self.DAILY_VOTE_LIMITS.get(user_plan, 0)}) per il tuo piano '{user_plan.value}'.")
 
-        existing_vote = self.supabase.table('votes').select('*').eq('user_id', user_id).eq('content_id', content_id).maybe_single().execute()
-        if existing_vote.data:
+        existing_vote = UserManager(self.supabase)._execute_supabase_query(
+            self.supabase.table('votes').select('*').eq('user_id', user_id).eq('content_id', content_id).maybe_single(),
+            "check existing vote"
+        )
+        if existing_vote:
+            logger.warning(f"User {user_id} already voted for content {content_id}.")
             raise HTTPException(status_code=400, detail="Hai già votato questo contenuto.")
 
-        content_owner_res = self.supabase.table('ai_contents').select('user_id').eq('id', content_id).maybe_single().execute()
-        if content_owner_res.data and content_owner_res.data['user_id'] == user_id:
+        content_owner_res = UserManager(self.supabase)._execute_supabase_query(
+            self.supabase.table('ai_contents').select('user_id').eq('id', content_id).maybe_single(),
+            "get content owner"
+        )
+        if content_owner_res and content_owner_res['user_id'] == user_id:
+            logger.warning(f"User {user_id} tried to vote for their own content {content_id}.")
             raise HTTPException(status_code=400, detail="Non puoi votare il tuo stesso contenuto.")
 
-        self.supabase.table('votes').insert({'user_id': user_id, 'content_id': content_id}).execute()
-        self.supabase.rpc('increment_content_votes', {'p_content_id': content_id}).execute()
+        UserManager(self.supabase)._execute_supabase_query(
+            self.supabase.table('votes').insert({'user_id': user_id, 'content_id': content_id}),
+            "insert new vote"
+        )
+        UserManager(self.supabase)._execute_supabase_query(
+            self.supabase.rpc('increment_content_votes', {'p_content_id': content_id}),
+            "increment content votes RPC"
+        )
 
-        self.supabase.table('users').update({
-            'daily_votes_used': daily_votes_used + 1
-        }).eq('user_id', user_id).execute()
-
+        UserManager(self.supabase)._execute_supabase_query(
+            self.supabase.table('users').update({
+                'daily_votes_used': daily_votes_used + 1
+            }).eq('user_id', user_id),
+            "increment daily votes usage"
+        )
+        logger.info(f"User {user_id} successfully voted for content {content_id}.")
         return {"status": "success", "message": "Voto registrato con successo!"}
 
 class ContestManager:
@@ -454,54 +593,84 @@ class ContestManager:
     }
 
     def get_current_contest(self, user_plan: SubscriptionPlan):
+        logger.info(f"Fetching current contest for plan: {user_plan.value}")
         now = datetime.now(timezone.utc)
-        response = self.supabase.table('contests').select('*') \
-            .lte('start_date', now.isoformat()) \
-            .gte('end_date', now.isoformat()) \
-            .contains('min_plan_access', [user_plan.value]) \
-            .order('end_date', desc=False) \
-            .limit(1).maybe_single().execute()
+        result = UserManager(self.supabase)._execute_supabase_query(
+            self.supabase.table('contests').select('*') \
+                .lte('start_date', now.isoformat()) \
+                .gte('end_date', now.isoformat()) \
+                .contains('min_plan_access', [user_plan.value]) \
+                .order('end_date', desc=False) \
+                .limit(1).maybe_single(),
+            f"fetch current contest for plan {user_plan.value}"
+        )
         
-        if response.data:
-            response.data['reward_pool_euro'] = self.CONTEST_REWARD_POOLS.get(user_plan, 0.00)
-            return response.data
+        if result: # result is the data itself, not a response object
+            result['reward_pool_euro'] = self.CONTEST_REWARD_POOLS.get(user_plan, 0.00)
+            logger.info(f"Found active contest: {result['theme_prompt']}")
+            return result
+        logger.info(f"No active contest found for plan {user_plan.value}.")
         return None
 
     def get_leaderboard(self):
-        response = self.supabase.table('users').select('display_name, avatar_url, points_balance').order('points_balance', desc=True).limit(100).execute()
-        return response.data
+        logger.info("Fetching leaderboard.")
+        response_data = UserManager(self.supabase)._execute_supabase_query(
+            self.supabase.table('users').select('display_name, avatar_url, points_balance').order('points_balance', desc=True).limit(100),
+            "fetch leaderboard"
+        )
+        logger.info(f"Fetched {len(response_data) if response_data else 0} users for leaderboard.")
+        return response_data if response_data else []
 
 class ShopManager:
     def __init__(self, supabase: Client): self.supabase = supabase
 
     def get_shop_items(self):
-        response = self.supabase.table('shop_items').select('*').order('price_points', desc=False).execute()
-        return response.data
+        logger.info("Fetching shop items.")
+        response_data = UserManager(self.supabase)._execute_supabase_query(
+            self.supabase.table('shop_items').select('*').order('price_points', desc=False),
+            "fetch shop items"
+        )
+        logger.info(f"Fetched {len(response_data) if response_data else 0} shop items.")
+        return response_data if response_data else []
 
     async def buy_item(self, req: ShopBuyRequest):
+        logger.info(f"User {req.user_id} attempting to buy item {req.item_id} with {req.payment_method}.")
         user_profile = UserManager(self.supabase).get_user_profile(req.user_id)
-        item_res = self.supabase.table('shop_items').select('*').eq('id', req.item_id).maybe_single().execute()
+        item = UserManager(self.supabase)._execute_supabase_query(
+            self.supabase.table('shop_items').select('*').eq('id', req.item_id).maybe_single(),
+            f"fetch shop item {req.item_id}"
+        )
         
-        if not item_res.data: raise HTTPException(status_code=404, detail="Item not found.")
-        item = item_res.data
+        if not item: 
+            logger.warning(f"Item {req.item_id} not found for purchase by user {req.user_id}.")
+            raise HTTPException(status_code=404, detail="Item not found.")
 
         if req.payment_method == 'points':
             if user_profile['points_balance'] < item['price_points']:
+                logger.warning(f"User {req.user_id} has insufficient points ({user_profile['points_balance']}) to buy item {req.item_id} (needed {item['price_points']}).")
                 raise HTTPException(status_code=402, detail="Punti insufficienti per l'acquisto.")
             
-            self.supabase.rpc('deduct_points', {
-                'p_user_id': req.user_id,
-                'p_amount': item['price_points'],
-                'p_reason': f'Shop Purchase: {item["name"]} (Points)'
-            }).execute()
+            UserManager(self.supabase)._execute_supabase_query(
+                self.supabase.rpc('deduct_points', {
+                    'p_user_id': req.user_id,
+                    'p_amount': item['price_points'],
+                    'p_reason': f'Shop Purchase: {item["name"]} (Points)'
+                }),
+                "deduct points for shop item"
+            )
 
             await self._apply_item_effect(req.user_id, item, req.payment_method, item['price_points'], None)
 
+            logger.info(f"User {req.user_id} successfully bought item {item['name']} with points.")
             return {"status": "success", "message": f"Acquisto di '{item['name']}' completato con successo con i punti!"}
         
         elif req.payment_method == 'stripe':
-            if not STRIPE_SECRET_KEY: raise HTTPException(status_code=500, detail="Stripe not configured.")
-            if not item['price_eur']: raise HTTPException(status_code=400, detail="Questo articolo non ha un prezzo in EUR definito.")
+            if not STRIPE_SECRET_KEY: 
+                logger.error("Stripe not configured for shop purchases.")
+                raise HTTPException(status_code=500, detail="Stripe not configured.")
+            if not item['price_eur']: 
+                logger.warning(f"Item {req.item_id} does not have EUR price defined for Stripe purchase.")
+                raise HTTPException(status_code=400, detail="Questo articolo non ha un prezzo in EUR definito.")
 
             try:
                 payment_intent = stripe.PaymentIntent.create(
@@ -510,41 +679,55 @@ class ShopManager:
                     metadata={'user_id': req.user_id, 'item_id': item['id'], 'item_name': item['name']},
                     automatic_payment_methods={'enabled': True}
                 )
+                logger.info(f"Stripe Payment Intent created for user {req.user_id}, item {item['name']}.")
                 return {"payment_required": True, "client_secret": payment_intent.client_secret, "message": "Procedi al pagamento Stripe."}
 
             except stripe.error.StripeError as e:
+                logger.error(f"Stripe error during Payment Intent creation: {e.user_message}")
                 raise HTTPException(status_code=500, detail=f"Errore Stripe: {e.user_message}")
             except Exception as e:
+                logger.error(f"Unexpected error creating Payment Intent: {e}")
                 raise HTTPException(status_code=500, detail=f"Errore nella creazione del Payment Intent: {e}")
 
     async def _apply_item_effect(self, user_id: str, item: dict, payment_method: str, amount_points: float | None, amount_eur: float | None):
+        logger.info(f"Applying effect for item {item['name']} to user {user_id}. Type: {item['item_type']}")
         if item['item_type'] == ItemType.BOOST.value:
-            print(f"Applicato boost '{item['name']}' all'utente {user_id}. Effetto: {item.get('effect')}")
+            logger.info(f"Boost '{item['name']}' applied to user {user_id}. Effect: {item.get('effect')}")
         
         elif item['item_type'] == ItemType.COSMETIC.value:
-            print(f"Applicato cosmetico '{item['name']}' all'utente {user_id}. Effetto: {item.get('effect')}")
+            logger.info(f"Cosmetic '{item['name']}' applied to user {user_id}. Effect: {item.get('effect')}")
         
         elif item['item_type'] == ItemType.GENERATION_PACK.value:
             effect_data = json.loads(item.get('effect', '{}'))
             generations_to_add = effect_data.get('generations', 0)
             if generations_to_add > 0:
-                user_res = self.supabase.table('users').select('daily_ai_generations_used').eq('user_id', user_id).maybe_single().execute()
-                if user_res.data:
-                    current_generations_used = user_res.data['daily_ai_generations_used']
-                    self.supabase.table('users').update({
-                        'daily_ai_generations_used': current_generations_used - generations_to_add
-                    }).eq('user_id', user_id).execute()
-                    print(f"Aggiunte {generations_to_add} generazioni AI all'utente {user_id}.")
+                user_res = UserManager(self.supabase)._execute_supabase_query(
+                    self.supabase.table('users').select('daily_ai_generations_used').eq('user_id', user_id).maybe_single(),
+                    "fetch user daily generations for item effect"
+                )
+                if user_res:
+                    current_generations_used = user_res['daily_ai_generations_used']
+                    UserManager(self.supabase)._execute_supabase_query(
+                        self.supabase.table('users').update({
+                            'daily_ai_generations_used': current_generations_used - generations_to_add # Allows more generations by reducing the count
+                        }).eq('user_id', user_id),
+                        "update user daily generations with item effect"
+                    )
+                    logger.info(f"Added {generations_to_add} AI generations to user {user_id}.")
 
-        self.supabase.table('user_purchases').insert({
-            'user_id': user_id,
-            'item_id': item['id'],
-            'purchase_date': datetime.now(timezone.utc).isoformat(),
-            'payment_method': payment_method,
-            'amount_paid_points': amount_points,
-            'amount_paid_eur': amount_eur,
-            'status': 'completed'
-        }).execute()
+        UserManager(self.supabase)._execute_supabase_query(
+            self.supabase.table('user_purchases').insert({
+                'user_id': user_id,
+                'item_id': item['id'],
+                'purchase_date': datetime.now(timezone.utc).isoformat(),
+                'payment_method': payment_method,
+                'amount_paid_points': amount_points,
+                'amount_paid_eur': amount_eur,
+                'status': 'completed'
+            }),
+            "log user purchase"
+        )
+        logger.info(f"Item effect for {item['name']} applied and purchase logged for user {user_id}.")
 
 def get_user_manager(supabase: Client = Depends(get_supabase_client)): return UserManager(supabase)
 def get_ai_manager(supabase: Client = Depends(get_supabase_client)): return AIManager(supabase)
@@ -559,109 +742,153 @@ def read_root():
 def sync_user_endpoint(user_data: UserSyncRequest, user_manager: UserManager = Depends(get_user_manager)):
     try:
         return user_manager.sync_user(user_data)
+    except HTTPException as e:
+        logger.error(f"HTTPException in sync_user_endpoint: {e.detail}")
+        raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error during user sync: {str(e)}")
+        logger.critical(f"Unhandled exception in sync_user_endpoint for user {user_data.user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error during user sync: {str(e)}")
 
 @app.post("/update_profile/{user_id}")
 def update_profile_endpoint(user_id: str, profile_data: UserProfileUpdate, user_manager: UserManager = Depends(get_user_manager)):
     try:
         return user_manager.update_profile(user_id, profile_data)
+    except HTTPException as e: raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.critical(f"Unhandled exception in update_profile_endpoint for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/request_payout")
 def request_payout_endpoint(payout_data: PayoutRequest, user_manager: UserManager = Depends(get_user_manager)):
+    logger.info(f"Payout request from user {payout_data.user_id} for {payout_data.points_amount} points.")
     try:
         supabase = get_supabase_client()
         value_eur = payout_data.points_amount / POINTS_TO_EUR_RATE
-        result = supabase.rpc('request_payout_function', { 
-            'p_user_id': payout_data.user_id, 
-            'p_points_amount': payout_data.points_amount, 
-            'p_value_in_eur': value_eur, 
-            'p_method': payout_data.method, 
-            'p_address': payout_data.address 
-        }).execute()
+        result = UserManager(supabase)._execute_supabase_query(
+            supabase.rpc('request_payout_function', { 
+                'p_user_id': payout_data.user_id, 
+                'p_points_amount': payout_data.points_amount, 
+                'p_value_in_eur': value_eur, 
+                'p_method': payout_data.method, 
+                'p_address': payout_data.address 
+            }),
+            "request payout RPC"
+        )
         
-        if result.data and isinstance(result.data, list) and len(result.data) > 0:
-            return {"status": "success", "message": result.data[0].get('message', "Your payout request has been sent and will be processed soon!")}
+        if result and isinstance(result, list) and len(result) > 0:
+            logger.info(f"Payout request successful for user {payout_data.user_id}.")
+            return {"status": "success", "message": result[0].get('message', "Your payout request has been sent and will be processed soon!")}
         
+        logger.error(f"Unexpected RPC return for request_payout_function for user {payout_data.user_id}: {result}")
         raise HTTPException(status_code=400, detail="Failed to process payout request. Check database function logs.")
 
-    except Exception as e:
-        if 'Punti insufficienti' in str(e):
+    except HTTPException as e:
+        if 'Punti insufficienti' in e.detail:
             raise HTTPException(status_code=402, detail="Punti insufficienti per il prelievo.")
-        raise HTTPException(status_code=500, detail=f"Error processing payout request: {str(e)}")
+        logger.error(f"HTTPException in request_payout_endpoint: {e.detail}")
+        raise e
+    except Exception as e:
+        logger.critical(f"Unhandled exception in request_payout_endpoint for user {payout_data.user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error processing payout request: {str(e)}")
 
 @app.get("/users/{user_id}/profile")
 def get_user_profile_endpoint(user_id: str, user_manager: UserManager = Depends(get_user_manager)):
     try:
         return user_manager.get_user_profile(user_id)
     except HTTPException as e: raise e
-    except Exception as e: raise HTTPException(status_code=500, detail=f"Error fetching user profile: {e}")
+    except Exception as e:
+        logger.critical(f"Unhandled exception in get_user_profile_endpoint for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/get_user_balance/{user_id}")
 def get_user_balance_endpoint(user_id: str, user_manager: UserManager = Depends(get_user_manager)):
     try:
         return user_manager.get_user_balance(user_id)
     except HTTPException as e: raise e
-    except Exception as e: raise HTTPException(status_code=500, detail=f"Error fetching user balance: {e}")
+    except Exception as e:
+        logger.critical(f"Unhandled exception in get_user_balance_endpoint for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/streak/status/{user_id}")
 def get_streak_status_endpoint(user_id: str, user_manager: UserManager = Depends(get_user_manager)):
     try:
         return user_manager.get_streak_status(user_id)
     except HTTPException as e: raise e
-    except Exception as e: raise HTTPException(status_code=500, detail=f"Error fetching streak status: {e}")
+    except Exception as e:
+        logger.critical(f"Unhandled exception in get_streak_status_endpoint for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/streak/claim/{user_id}")
 def claim_streak_reward_endpoint(user_id: str, user_manager: UserManager = Depends(get_user_manager)):
     try:
         return user_manager.claim_streak_reward(user_id)
     except HTTPException as e: raise e
-    except Exception as e: raise HTTPException(status_code=500, detail=f"Error claiming streak reward: {e}")
+    except Exception as e:
+        logger.critical(f"Unhandled exception in claim_streak_reward_endpoint for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/leaderboard")
 def get_leaderboard_endpoint(contest_manager: ContestManager = Depends(get_contest_manager)):
     try:
         return contest_manager.get_leaderboard()
     except HTTPException as e: raise e
-    except Exception as e: raise HTTPException(status_code=500, detail=f"Error fetching leaderboard: {e}")
+    except Exception as e:
+        logger.critical(f"Unhandled exception in get_leaderboard_endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/referral_stats/{user_id}")
 def get_referral_stats_endpoint(user_id: str, user_manager: UserManager = Depends(get_user_manager)):
     try:
         return user_manager.get_referral_stats(user_id)
     except HTTPException as e: raise e
-    except Exception as e: raise HTTPException(status_code=500, detail=f"Error fetching referral stats: {e}")
+    except Exception as e:
+        logger.critical(f"Unhandled exception in get_referral_stats_endpoint for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/ai/generate-advice")
 async def generate_advice_endpoint(req: AIAdviceRequest, ai_manager: AIManager = Depends(get_ai_manager)):
-    return await ai_manager.generate_advice(req)
+    try:
+        return await ai_manager.generate_advice(req)
+    except HTTPException as e: raise e
+    except Exception as e:
+        logger.critical(f"Unhandled exception in generate_advice_endpoint for user {req.user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/ai/generate")
 async def generate_content_endpoint(req: AIGenerationRequest, ai_manager: AIManager = Depends(get_ai_manager)):
-    return await ai_manager.generate_content(req)
+    try:
+        return await ai_manager.generate_content(req)
+    except HTTPException as e: raise e
+    except Exception as e:
+        logger.critical(f"Unhandled exception in generate_content_endpoint for user {req.user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/ai/content/{ai_content_id}/publish")
 def publish_content_endpoint(ai_content_id: int, ai_manager: AIManager = Depends(get_ai_manager)):
     try:
         return ai_manager.publish_ai_content(ai_content_id)
+    except HTTPException as e: raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error publishing content: {e}")
+        logger.critical(f"Unhandled exception in publish_content_endpoint for content {ai_content_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/ai/content/feed")
 async def get_content_feed_endpoint(ai_manager: AIManager = Depends(get_ai_manager)):
     try:
         return await ai_manager.get_feed()
+    except HTTPException as e: raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching content feed: {e}")
+        logger.critical(f"Unhandled exception in get_content_feed_endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/ai/content/{content_id}/vote")
 async def vote_content_endpoint(content_id: int, req: VoteContentRequest, ai_manager: AIManager = Depends(get_ai_manager)):
     try:
         return await ai_manager.vote_content(content_id, req.user_id)
     except HTTPException as e: raise e
-    except Exception as e: raise HTTPException(status_code=500, detail=f"Error voting content: {e}")
+    except Exception as e:
+        logger.critical(f"Unhandled exception in vote_content_endpoint for content {content_id} by user {req.user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/contests/current/{user_id}")
 def get_current_contest_endpoint(user_id: str, contest_manager: ContestManager = Depends(get_contest_manager), user_manager: UserManager = Depends(get_user_manager)):
@@ -673,18 +900,27 @@ def get_current_contest_endpoint(user_id: str, contest_manager: ContestManager =
             raise HTTPException(status_code=404, detail="Nessun contest attivo disponibile per il tuo piano al momento.")
         return contest
     except HTTPException as e: raise e
-    except Exception as e: raise HTTPException(status_code=500, detail=f"Error fetching current contest: {e}")
+    except Exception as e:
+        logger.critical(f"Unhandled exception in get_current_contest_endpoint for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/shop/items")
 def get_shop_items_endpoint(shop_manager: ShopManager = Depends(get_shop_manager)):
     try:
         return shop_manager.get_shop_items()
+    except HTTPException as e: raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching shop items: {e}")
+        logger.critical(f"Unhandled exception in get_shop_items_endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/shop/buy")
 async def buy_shop_item_endpoint(req: ShopBuyRequest, shop_manager: ShopManager = Depends(get_shop_manager)):
-    return await shop_manager.buy_item(req)
+    try:
+        return await shop_manager.buy_item(req)
+    except HTTPException as e: raise e
+    except Exception as e:
+        logger.critical(f"Unhandled exception in buy_shop_item_endpoint for user {req.user_id}, item {req.item_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/create-checkout-session")
 def create_checkout_session_endpoint(req: CreateSubscriptionRequest, supabase: Client = Depends(get_supabase_client)):
@@ -697,19 +933,26 @@ def create_checkout_session_endpoint(req: CreateSubscriptionRequest, supabase: C
     if not price_id: raise HTTPException(status_code=400, detail="Invalid plan type specified.")
     
     try:
-        user_res = supabase.table('users').select('email, stripe_customer_id').eq('user_id', req.user_id).maybe_single().execute()
-        if not user_res.data: raise HTTPException(status_code=404, detail="User not found.")
+        user_res = UserManager(supabase)._execute_supabase_query(
+            supabase.table('users').select('email, stripe_customer_id').eq('user_id', req.user_id).maybe_single(),
+            "fetch user for Stripe checkout"
+        )
+        if not user_res: raise HTTPException(status_code=404, detail="User not found.")
         
-        user_data = user_res.data
+        user_data = user_res
         customer_id = user_data.get('stripe_customer_id')
         
         if not customer_id:
+            logger.info(f"Creating new Stripe customer for user {req.user_id}.")
             customer = stripe.Customer.create(
                 email=user_data.get('email'),
                 metadata={'user_id': req.user_id}
             )
             customer_id = customer.id
-            supabase.table('users').update({'stripe_customer_id': customer_id}).eq('user_id', req.user_id).execute()
+            UserManager(supabase)._execute_supabase_query(
+                supabase.table('users').update({'stripe_customer_id': customer_id}).eq('user_id', req.user_id),
+                "update user with Stripe customer ID"
+            )
         
         checkout_session = stripe.checkout.Session.create(
             customer=customer_id,
@@ -722,11 +965,15 @@ def create_checkout_session_endpoint(req: CreateSubscriptionRequest, supabase: C
                 'plan_type': req.plan_type
             }
         )
+        logger.info(f"Stripe Checkout Session created for user {req.user_id}.")
         return {"url": checkout_session.url}
     except stripe.error.StripeError as e:
+        logger.error(f"Stripe error creating checkout session: {e.user_message}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Errore Stripe: {e.user_message}")
+    except HTTPException as e: raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore nella creazione della sessione di checkout: {e}")
+        logger.critical(f"Unhandled exception in create_checkout_session_endpoint for user {req.user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/stripe-webhook")
 async def stripe_webhook(request: Request, supabase: Client = Depends(get_supabase_client)):
@@ -734,19 +981,24 @@ async def stripe_webhook(request: Request, supabase: Client = Depends(get_supaba
     sig_header = request.headers.get('stripe-signature')
 
     if not STRIPE_WEBHOOK_SECRET:
+        logger.error("Stripe webhook secret not configured. Cannot process webhooks.")
         raise HTTPException(status_code=500, detail="Stripe webhook secret not configured.")
 
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except ValueError as e:
+        logger.error(f"Invalid payload for Stripe webhook: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
     except stripe.error.SignatureVerificationError as e:
+        logger.error(f"Invalid signature for Stripe webhook: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid signature: {e}")
     except Exception as e:
+        logger.error(f"Unexpected error processing Stripe webhook event: {e}")
         raise HTTPException(status_code=400, detail=f"Webhook error: {e}")
 
     event_type = event['type']
     data_object = event['data']['object']
+    logger.info(f"Received Stripe webhook event type: {event_type}")
 
     if event_type == 'customer.subscription.created' or event_type == 'customer.subscription.updated':
         subscription = data_object
@@ -754,10 +1006,13 @@ async def stripe_webhook(request: Request, supabase: Client = Depends(get_supaba
         price_id = subscription['items']['data'][0]['price']['id']
         status = subscription.get('status')
         
-        user_res = supabase.table('users').select('user_id').eq('stripe_customer_id', customer_id).maybe_single().execute()
+        user_res = UserManager(supabase)._execute_supabase_query(
+            supabase.table('users').select('user_id').eq('stripe_customer_id', customer_id).maybe_single(),
+            "fetch user for subscription webhook"
+        )
         
-        if user_res.data:
-            user_id = user_res.data['user_id']
+        if user_res:
+            user_id = user_res['user_id']
             new_plan = SubscriptionPlan.FREE.value
             
             if price_id == STRIPE_PRICE_ID_PREMIUM:
@@ -766,15 +1021,34 @@ async def stripe_webhook(request: Request, supabase: Client = Depends(get_supaba
                 new_plan = SubscriptionPlan.ASSISTANT.value
             
             if status in ['active', 'trialing']:
-                supabase.table('users').update({'subscription_plan': new_plan}).eq('user_id', user_id).execute()
+                UserManager(supabase)._execute_supabase_query(
+                    supabase.table('users').update({'subscription_plan': new_plan}).eq('user_id', user_id),
+                    "update user subscription plan"
+                )
+                logger.info(f"User {user_id} subscription plan updated to {new_plan} (status: {status}).")
             else:
-                supabase.table('users').update({'subscription_plan': SubscriptionPlan.FREE.value}).eq('user_id', user_id).execute()
+                UserManager(supabase)._execute_supabase_query(
+                    supabase.table('users').update({'subscription_plan': SubscriptionPlan.FREE.value}).eq('user_id', user_id),
+                    "revert user subscription plan"
+                )
+                logger.info(f"User {user_id} subscription plan reverted to FREE (status: {status}).")
+        else:
+            logger.warning(f"User not found for Stripe customer ID: {customer_id} during subscription webhook.")
 
     elif event_type == 'customer.subscription.deleted':
         customer_id = data_object.get('customer')
-        user_res = supabase.table('users').select('user_id').eq('stripe_customer_id', customer_id).maybe_single().execute()
-        if user_res.data:
-            supabase.table('users').update({'subscription_plan': SubscriptionPlan.FREE.value}).eq('user_id', user_res.data['user_id']).execute()
+        user_res = UserManager(supabase)._execute_supabase_query(
+            supabase.table('users').select('user_id').eq('stripe_customer_id', customer_id).maybe_single(),
+            "fetch user for deleted subscription webhook"
+        )
+        if user_res:
+            UserManager(supabase)._execute_supabase_query(
+                supabase.table('users').update({'subscription_plan': SubscriptionPlan.FREE.value}).eq('user_id', user_res['user_id']),
+                "revert user plan on subscription delete"
+            )
+            logger.info(f"User {user_res['user_id']} subscription deleted, reverted to FREE plan.")
+        else:
+            logger.warning(f"User not found for Stripe customer ID: {customer_id} during deleted subscription webhook.")
             
     elif event_type == 'payment_intent.succeeded':
         payment_intent = data_object
@@ -782,12 +1056,21 @@ async def stripe_webhook(request: Request, supabase: Client = Depends(get_supaba
         item_id = payment_intent['metadata'].get('item_id')
         
         if user_id and item_id:
-            item_res = supabase.table('shop_items').select('*').eq('id', int(item_id)).maybe_single().execute()
-            if item_res.data:
-                item = item_res.data
+            item_res = UserManager(supabase)._execute_supabase_query(
+                supabase.table('shop_items').select('*').eq('id', int(item_id)).maybe_single(),
+                "fetch item for payment intent succeeded"
+            )
+            if item_res:
+                item = item_res
                 shop_manager = ShopManager(supabase)
                 await shop_manager._apply_item_effect(user_id, item, 'stripe', None, item['price_eur'])
+                logger.info(f"Payment intent succeeded for user {user_id}, item {item['name']}. Effect applied.")
             else:
-                print(f"Warning: Item {item_id} not found for successful payment intent for user {user_id}.")
+                logger.warning(f"Item {item_id} not found for successful payment intent for user {user_id}.")
+        else:
+            logger.warning(f"Missing user_id or item_id in metadata for payment_intent.succeeded: {payment_intent['metadata']}")
+
+    else:
+        logger.info(f"Unhandled Stripe event type: {event_type}")
 
     return Response(status_code=200)
