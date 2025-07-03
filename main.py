@@ -1,6 +1,3 @@
-# main.py - Versione Definitiva e Completa
-# Data: 3 Luglio 2025
-
 import os
 import time
 from datetime import datetime, timezone, timedelta
@@ -14,16 +11,13 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 import stripe
-import paypalrestsdk
 
-# --- Configurazione Iniziale ---
+# --- Initial Configuration ---
 load_dotenv()
 
-# Caricamento sicuro delle chiavi dalle variabili d'ambiente
+# Securely load keys from environment variables
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
-PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
-PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
@@ -32,23 +26,9 @@ GCP_SA_KEY_JSON_STR = os.environ.get("GCP_SA_KEY_JSON")
 STRIPE_PRICE_ID_PREMIUM = os.environ.get("STRIPE_PRICE_ID_PREMIUM")
 STRIPE_PRICE_ID_ASSISTANT = os.environ.get("STRIPE_PRICE_ID_ASSISTANT")
 
-# --- Inizializzazione dei Servizi ---
-app = FastAPI(title="Zenith Rewards Backend", description="API per la gestione dell'app Zenith Rewards.")
-from fastapi.middleware.cors import CORSMiddleware
+# --- Service Initialization ---
+app = FastAPI(title="Zenith Rewards Backend")
 
-# Allowed origins
-origins = [
-    "https://cashhh-52f38.web.app",
-    "http://localhost:3000",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"], # Allows all methods
-    allow_headers=["*"], # Allows all headers
-)
 vertexai = None
 if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
     try:
@@ -57,20 +37,26 @@ if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
         import vertexai
         from vertexai.generative_models import GenerativeModel
         vertexai.init(project=GCP_PROJECT_ID, location=GCP_REGION)
-        print("Vertex AI inizializzato correttamente.")
+        print("Vertex AI initialized successfully.")
     except Exception as e:
-        print(f"ATTENZIONE: Errore config Vertex AI: {e}")
+        print(f"WARNING: Vertex AI config error: {e}")
 else:
-    print("ATTENZIONE: Credenziali GCP mancanti. Vertex AI è disabilitato.")
+    print("WARNING: Missing GCP credentials. Vertex AI is disabled.")
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 else:
-    print("AVVISO: STRIPE_SECRET_KEY non configurato.")
+    print("WARNING: STRIPE_SECRET_KEY not configured.")
 
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000", "https://cashhh-52f38.web.app", "https://cashhh-52738.web.app"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "https://cashhh-52f38.web.app", "https://cashhh-52738.web.app"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# --- Modelli Dati (Pydantic) e Costanti ---
+# --- Data Models (Pydantic) & Constants ---
 POINTS_TO_EUR_RATE = 1000.0
 class SubscriptionPlan(str, Enum): FREE = 'free'; PREMIUM = 'premium'; ASSISTANT = 'assistant'
 class UserSyncRequest(BaseModel): user_id: str; email: str | None = None; displayName: str | None = None; referrer_id: str | None = None; avatar_url: str | None = None
@@ -79,14 +65,13 @@ class PayoutRequest(BaseModel): user_id: str; points_amount: int; method: str; a
 class UserProfileUpdate(BaseModel): display_name: str | None = None; avatar_url: str | None = None
 class CreateSubscriptionRequest(BaseModel): user_id: str; plan_type: str; success_url: str; cancel_url: str
 
-# --- Funzioni Helper ---
+# --- Helper Functions ---
 def get_supabase_client() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- Endpoint dell'API ---
-
+# --- API Endpoints ---
 @app.get("/")
-def read_root(): return {"message": "Zenith Rewards Backend API. Tutti i sistemi sono operativi."}
+def read_root(): return {"message": "Zenith Rewards Backend is operational."}
 
 @app.post("/sync_user")
 def sync_user(user_data: UserSyncRequest):
@@ -106,18 +91,20 @@ def sync_user(user_data: UserSyncRequest):
                 elif days_diff > 1: new_streak = 1
             supabase.table('users').update({'last_login_at': now.isoformat(), 'login_streak': new_streak}).eq('user_id', user_data.user_id).execute()
         return {"status": "success"}
-    except Exception as e: raise HTTPException(status_code=500, detail=f"Errore durante la sincronizzazione utente: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error during user sync: {str(e)}")
 
 @app.post("/update_profile/{user_id}")
 def update_profile(user_id: str, profile_data: UserProfileUpdate):
     try:
         supabase = get_supabase_client()
-        update_payload = {'display_name': profile_data.display_name, 'avatar_url': profile_data.avatar_url}
+        update_payload = { 'display_name': profile_data.display_name, 'avatar_url': profile_data.avatar_url }
         update_payload = {k: v for k, v in update_payload.items() if v is not None}
-        if not update_payload: raise HTTPException(status_code=400, detail="Nessun dato da aggiornare.")
+        if not update_payload: raise HTTPException(status_code=400, detail="No data provided to update.")
         supabase.table('users').update(update_payload).eq('user_id', user_id).execute()
-        return {"status": "success", "message": "Profilo aggiornato."}
-    except Exception as e: raise HTTPException(status_code=500, detail=f"Errore durante l'aggiornamento del profilo: {str(e)}")
+        return {"status": "success", "message": "Profile updated successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/request_payout")
 def request_payout(payout_data: PayoutRequest):
@@ -125,19 +112,10 @@ def request_payout(payout_data: PayoutRequest):
         supabase = get_supabase_client()
         value_eur = payout_data.points_amount / POINTS_TO_EUR_RATE
         supabase.rpc('request_payout_function', { 'p_user_id': payout_data.user_id, 'p_points_amount': payout_data.points_amount, 'p_value_in_eur': value_eur, 'p_method': payout_data.method, 'p_address': payout_data.address }).execute()
-        return {"status": "success", "message": "La tua richiesta di prelievo è stata inviata e sarà processata presto!"}
+        return {"status": "success", "message": "Your payout request has been sent and will be processed soon!"}
     except Exception as e:
-        if 'Punti insufficienti' in str(e): raise HTTPException(status_code=402, detail="Punti prelevabili insufficienti.")
-        raise HTTPException(status_code=500, detail=f"Errore durante l'elaborazione della richiesta: {str(e)}")
-
-@app.get("/get_user_balance/{user_id}")
-def get_user_balance(user_id: str):
-    try:
-        supabase = get_supabase_client()
-        response = supabase.table('users').select('points_balance, pending_points_balance').eq('user_id', user_id).maybe_single().execute()
-        if not response.data: return {"points_balance": 0, "pending_points_balance": 0}
-        return {"points_balance": response.data.get('points_balance', 0), "pending_points_balance": response.data.get('pending_points_balance', 0)}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+        if 'Punti insufficienti' in str(e): raise HTTPException(status_code=402, detail="Insufficient withdrawable points.")
+        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
 
 @app.get("/users/{user_id}/profile")
 def get_user_profile(user_id: str):
@@ -146,43 +124,41 @@ def get_user_profile(user_id: str):
         response = supabase.table('users').select('subscription_plan, daily_ai_generations_used').eq('user_id', user_id).maybe_single().execute()
         if not response.data: return {"subscription_plan": "free", "daily_ai_generations_used": 0}
         return response.data
-    except Exception as e: raise HTTPException(status_code=500, detail=f"Errore recupero profilo: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching user profile: {e}")
 
 @app.post("/ai/generate-advice")
 def generate_advice(req: AIAdviceRequest):
-    if not vertexai: raise HTTPException(status_code=503, detail="Servizio AI non disponibile.")
-    
+    if not vertexai: raise HTTPException(status_code=503, detail="AI service is not available.")
     supabase = get_supabase_client()
     user_res = supabase.table('users').select('subscription_plan').eq('user_id', req.user_id).maybe_single().execute()
-    if not user_res.data: raise HTTPException(status_code=404, detail="Utente non trovato.")
+    if not user_res.data: raise HTTPException(status_code=404, detail="User not found.")
     
     user_plan = user_res.data.get('subscription_plan', 'free')
-    final_prompt = ""
+    final_prompt = f"Given the goal '{req.prompt}', provide 3 brief, impactful tips."
     if user_plan == 'assistant':
-        final_prompt = f"Agisci come un mentore di business di livello mondiale. Dato l'obiettivo '{req.prompt}', crea una strategia passo passo estremamente dettagliata."
+        final_prompt = f"Act as a world-class business mentor. Given the goal '{req.prompt}', create a detailed step-by-step strategy."
     elif user_plan == 'premium':
-        final_prompt = f"Dato l'obiettivo '{req.prompt}', crea un piano d'azione dettagliato in 5-7 punti."
-    else:
-        final_prompt = f"Dato l'obiettivo '{req.prompt}', fornisci 3 consigli brevi e d'impatto."
-
+        final_prompt = f"Given the goal '{req.prompt}', create a 5-7 point action plan with practical examples."
+    
     try:
         model = GenerativeModel("gemini-1.5-flash")
         response = model.generate_content(final_prompt)
         return {"advice": response.text.strip()}
-    except Exception as e: raise HTTPException(status_code=503, detail=f"Errore servizio AI: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"AI service error: {e}")
 
 @app.post("/create-checkout-session")
 def create_checkout_session(req: CreateSubscriptionRequest):
-    if not stripe.api_key: raise HTTPException(status_code=500, detail="Stripe non configurato.")
-    
+    if not stripe.api_key: raise HTTPException(status_code=500, detail="Stripe not configured.")
     price_map = {'premium': STRIPE_PRICE_ID_PREMIUM, 'assistant': STRIPE_PRICE_ID_ASSISTANT}
     price_id = price_map.get(req.plan_type)
-    if not price_id: raise HTTPException(status_code=400, detail="Tipo di piano non valido.")
-
+    if not price_id: raise HTTPException(status_code=400, detail="Invalid plan type.")
+    
     try:
         supabase = get_supabase_client()
         user_res = supabase.table('users').select('email, stripe_customer_id').eq('user_id', req.user_id).maybe_single().execute()
-        if not user_res.data: raise HTTPException(status_code=404, detail="Utente non trovato.")
+        if not user_res.data: raise HTTPException(status_code=404, detail="User not found.")
         
         user_data = user_res.data
         customer_id = user_data.get('stripe_customer_id')
@@ -190,13 +166,14 @@ def create_checkout_session(req: CreateSubscriptionRequest):
             customer = stripe.Customer.create(email=user_data.get('email'), metadata={'user_id': req.user_id})
             customer_id = customer.id
             supabase.table('users').update({'stripe_customer_id': customer_id}).eq('user_id', req.user_id).execute()
-
+        
         checkout_session = stripe.checkout.Session.create(
             customer=customer_id, line_items=[{'price': price_id, 'quantity': 1}],
             mode='subscription', success_url=req.success_url, cancel_url=req.cancel_url
         )
         return {"url": checkout_session.url}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/stripe-webhook")
 async def stripe_webhook(request: Request):
@@ -205,26 +182,24 @@ async def stripe_webhook(request: Request):
     supabase = get_supabase_client()
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    except Exception as e: raise HTTPException(status_code=400, detail=f"Errore Webhook: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Webhook error: {e}")
 
     if event['type'] in ['customer.subscription.created', 'customer.subscription.updated']:
         subscription = event['data']['object']
         customer_id = subscription.get('customer')
         price_id = subscription['items']['data'][0]['price']['id']
         status = subscription.get('status')
-        
         user_res = supabase.table('users').select('user_id').eq('stripe_customer_id', customer_id).maybe_single().execute()
         if user_res.data:
             user_id = user_res.data['user_id']
             new_plan = SubscriptionPlan.FREE
             if price_id == STRIPE_PRICE_ID_PREMIUM: new_plan = SubscriptionPlan.PREMIUM
             elif price_id == STRIPE_PRICE_ID_ASSISTANT: new_plan = SubscriptionPlan.ASSISTANT
-            
             if status in ['active', 'trialing']:
                 supabase.table('users').update({'subscription_plan': new_plan.value}).eq('user_id', user_id).execute()
             else:
                 supabase.table('users').update({'subscription_plan': SubscriptionPlan.FREE.value}).eq('user_id', user_id).execute()
-
     elif event['type'] == 'customer.subscription.deleted':
         customer_id = event['data']['object'].get('customer')
         user_res = supabase.table('users').select('user_id').eq('stripe_customer_id', customer_id).maybe_single().execute()
