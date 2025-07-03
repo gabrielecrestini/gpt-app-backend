@@ -127,6 +127,39 @@ def get_user_profile(user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching user profile: {e}")
 
+# ### NUOVE FUNZIONI AGGIUNTE QUI ###
+@app.get("/get_user_balance/{user_id}")
+def get_user_balance(user_id: str):
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table('users').select('points_balance, pending_points_balance').eq('user_id', user_id).maybe_single().execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail="User not found")
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching user balance: {e}")
+
+@app.get("/streak/status/{user_id}")
+def get_streak_status(user_id: str):
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table('users').select('login_streak').eq('user_id', user_id).maybe_single().execute()
+        if not response.data:
+            return {"login_streak": 0}
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching streak status: {e}")
+
+@app.get("/leaderboard")
+def get_leaderboard():
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table('users').select('display_name, avatar_url, points_balance').order('points_balance', desc=True).limit(100).execute()
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching leaderboard: {e}")
+# ### FINE DELLE NUOVE FUNZIONI ###
+
 @app.post("/ai/generate-advice")
 def generate_advice(req: AIAdviceRequest):
     if not vertexai: raise HTTPException(status_code=503, detail="AI service is not available.")
