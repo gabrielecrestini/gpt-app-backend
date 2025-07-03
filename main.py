@@ -2,19 +2,20 @@ import os
 from datetime import datetime, timezone
 import json
 from enum import Enum
-from typing import Literal, Dict, Any
+from typing import Literal, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions
-from postgrest.exceptions import APIError as PostgrestAPIError # Import specifico per errori API Supabase
+from postgrest.exceptions import APIError as PostgrestAPIError
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 import stripe
 import vertexai
 from vertexai.generative_models import GenerativeModel, Part, Image
 
+# --- Initial Configuration ---
 load_dotenv()
 
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
@@ -28,6 +29,7 @@ STRIPE_PRICE_ID_PREMIUM = os.environ.get("STRIPE_PRICE_ID_PREMIUM")
 STRIPE_PRICE_ID_ASSISTANT = os.environ.get("STRIPE_PRICE_ID_ASSISTANT")
 PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
 
+# --- Service Initialization ---
 app = FastAPI(title="Zenith Rewards Backend", description="Backend per la gestione di utenti, AI, pagamenti e gamification per Zenith Rewards.")
 
 gemini_flash_model = None
@@ -36,12 +38,12 @@ vertexai_initialized = False
 
 # Configura il logging
 import logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
     try:
-        sa_key_path = "gcp_sa_key.json"
+        sa_key_path = "/tmp/gcp_sa_key.json" # Use /tmp for Render ephemeral storage
         with open(sa_key_path, "w") as f:
             f.write(GCP_SA_KEY_JSON_STR)
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_key_path
@@ -52,7 +54,7 @@ if all([GCP_PROJECT_ID, GCP_REGION, GCP_SA_KEY_JSON_STR]):
         vertexai_initialized = True
         logger.info("Vertex AI initialized successfully.")
     except Exception as e:
-        logger.error(f"WARNING: Vertex AI configuration error: {e}. AI functionalities might be limited or unavailable.")
+        logger.error(f"WARNING: Vertex AI configuration error: {e}. AI functionalities might be limited or unavailable.", exc_info=True)
 else:
     logger.warning("WARNING: Missing GCP credentials. Vertex AI is disabled.")
 
@@ -142,28 +144,31 @@ def get_supabase_client() -> Client:
     try:
         if not SUPABASE_URL or not SUPABASE_KEY:
             raise ValueError("Supabase credentials not configured.")
-        # Utilizza ClientOptions per una gestione più robusta dei timeout o retry
-        options = ClientOptions(postgrest_client_timeout=10, storage_client_timeout=10)
+        options = ClientOptions(postgrest_client_timeout=15, storage_client_timeout=15, headers={"apikey": SUPABASE_KEY}) # Added headers to ensure key is sent
         return create_client(SUPABASE_URL, SUPABASE_KEY, options=options)
     except Exception as e:
-        logger.critical(f"Failed to create Supabase client: {e}")
+        logger.critical(f"Failed to create Supabase client: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Supabase client initialization failed: {e}")
 
 class UserManager:
     def __init__(self, supabase: Client): self.supabase = supabase
 
-    def _execute_supabase_query(self, query_builder, error_message: str) -> Any:
+    def _execute_supabase_query(self, query_builder, error_context: str, raise_http_exception: bool = True) -> Any:
         try:
             result = query_builder.execute()
             if hasattr(result, 'data'):
                 return result.data
-            return result # For RPC calls that might return something else directly
+            return result
         except PostgrestAPIError as e:
-            logger.error(f"Supabase API Error in UserManager: {error_message} - {e.code}: {e.message} - {e.details}")
-            raise HTTPException(status_code=400, detail=f"Database error: {e.message}. Hint: {e.details}")
+            logger.error(f"Supabase API Error in UserManager ({error_context}): Code={e.code}, Message={e.message}, Details={e.details}", exc_info=True)
+            if raise_http_exception:
+                raise HTTPException(status_code=400, detail=f"Database error ({error_context}): {e.message}. Hint: {e.details}")
+            return None # Return None if not raising, for graceful handling
         except Exception as e:
-            logger.error(f"Unexpected error in UserManager: {error_message} - {e}")
-            raise HTTPException(status_code=500, detail=f"Internal server error during {error_message}.")
+            logger.error(f"Unexpected error in UserManager ({error_context}): {e}", exc_info=True)
+            if raise_http_exception:
+                raise HTTPException(status_code=500, detail=f"Internal server error during {error_context}.")
+            return None # Return None if not raising
 
     def sync_user(self, user_data: UserSyncRequest):
         now = datetime.now(timezone.utc)
@@ -171,7 +176,8 @@ class UserManager:
         
         user_record = self._execute_supabase_query(
             self.supabase.table('users').select('user_id, last_login_at, login_streak, daily_ai_generations_used, last_generation_reset_date, daily_votes_used, last_vote_reset_date').eq('user_id', user_data.user_id).maybe_single(),
-            "user sync fetch"
+            "user sync fetch",
+            raise_http_exception=False # Don't raise immediately, handle if user not found
         )
         
         if not user_record:
@@ -202,7 +208,7 @@ class UserManager:
             last_login_str = user_record.get('last_login_at')
             current_streak = user_record.get('login_streak', 0)
             
-            new_streak = 1 # Default a 1 se la streak è interrotta o non c'era un login precedente
+            new_streak = 1
             if last_login_str:
                 last_login_date = datetime.fromisoformat(last_login_str).date()
                 today = now.date()
@@ -210,7 +216,7 @@ class UserManager:
 
                 if days_diff == 1:
                     new_streak = current_streak + 1
-                elif days_diff == 0: # Già loggato oggi, non resettare la streak
+                elif days_diff == 0:
                     new_streak = current_streak
             
             update_data: Dict[str, Any] = {'last_login_at': now.isoformat(), 'login_streak': new_streak}
@@ -296,7 +302,6 @@ class UserManager:
             self.supabase.rpc('claim_streak_reward', {'p_user_id': user_id}),
             "claim streak RPC"
         )
-        # result_data from RPC is usually a list of dicts or single dict
         if result_data and isinstance(result_data, list) and len(result_data) > 0:
             return result_data[0]
         elif result_data and isinstance(result_data, dict):
@@ -363,11 +368,11 @@ class AIManager:
             logger.warning(f"User {req.user_id} exceeded AI generation limit for plan {user_plan.value}")
             raise HTTPException(status_code=429, detail=f"Hai raggiunto il limite di generazioni AI giornaliere ({self.AI_GENERATION_LIMITS.get(user_plan, 0)}) per il tuo piano '{user_plan.value}'. Effettua l'upgrade per più generazioni!")
 
-        final_prompt = f"Data l'idea o l'obiettivo '{req.prompt}', fornisci 3 consigli brevi e di impatto per il successo."
+        final_prompt = f"Given the goal '{req.prompt}', provide 3 brief, impactful tips."
         if user_plan == SubscriptionPlan.PREMIUM:
-            final_prompt = f"Agisci come un esperto di strategie aziendali. Data l'idea o l'obiettivo '{req.prompt}', crea un piano d'azione dettagliato di 5-7 punti con esempi pratici e suggerimenti per marketing e social media."
+            final_prompt = f"Act as a business strategy expert. Given the goal '{req.prompt}', create a detailed 5-7 point action plan with practical examples and suggestions for marketing and social media."
         elif user_plan == SubscriptionPlan.ASSISTANT:
-            final_prompt = f"Sei un mentore aziendale di livello mondiale e un esperto di marketing digitale, dropshipping, trading e social media. Data l'idea o l'obiettivo '{req.prompt}', crea una strategia passo-passo estremamente dettagliata e personalizzata, includendo tattiche specifiche per scalare sia i social della piattaforma Zenith Rewards che i social esterni, suggerimenti per il dropshipping, il trading e l'e-commerce, e un piano di viralità completo. La tua risposta deve essere completa, azionabile e coprire tutte le sfaccettature richieste."
+            final_prompt = f"You are a world-class business mentor and an expert in digital marketing, dropshipping, trading, and social media. Given the goal '{req.prompt}', create an extremely detailed and personalized step-by-step strategy, including specific tactics to scale both Zenith Rewards platform's social features and external social media, dropshipping, trading, and e-commerce tips, and a comprehensive virality plan. Your response must be complete, actionable, and cover all requested facets."
         
         try:
             logger.info(f"Generating AI advice for user {req.user_id} with prompt: {req.prompt[:50]}...")
@@ -383,8 +388,8 @@ class AIManager:
             logger.info(f"AI advice generated and usage incremented for user {req.user_id}.")
             return {"advice": generated_text}
         except Exception as e:
-            logger.error(f"Error during AI advice generation for user {req.user_id}: {e}")
-            raise HTTPException(status_code=503, detail=f"Errore del servizio AI: {e}. Riprova più tardi.")
+            logger.error(f"Error during AI advice generation for user {req.user_id}: {e}", exc_info=True)
+            raise HTTPException(status_code=503, detail=f"AI service error: {e}. Please try again later.")
 
     async def generate_content(self, req: AIGenerationRequest):
         if not vertexai_initialized:
@@ -401,7 +406,7 @@ class AIManager:
                 logger.warning(f"User {req.user_id} has insufficient points ({user_profile['points_balance']}) for AI content generation (needed {cost['points']}).")
                 raise HTTPException(status_code=402, detail=f"Punti insufficienti. Hai bisogno di {cost['points']} ZC.")
         elif req.payment_method == 'stripe':
-            pass
+            pass # Stripe payment intent will be created later
 
         generated_url = None
         generated_text = None
@@ -412,7 +417,8 @@ class AIManager:
             if req.content_type == ContentType.IMAGE:
                 if not gemini_pro_vision_model:
                      raise HTTPException(status_code=503, detail="AI image generation model not available.")
-                image_response = gemini_pro_vision_model.generate_content(f"Crea una breve descrizione testuale e un suggerimento visivo per un'immagine basata su: '{req.prompt}'.")
+                # Note: Direct image generation might need dedicated services like Imagen or DALL-E, this is a text-based simulation
+                image_response = gemini_pro_vision_model.generate_content(f"Create a short text description and visual suggestion for an image based on: '{req.prompt}'.")
                 generated_text = f"Immagine generata: {image_response.text.strip()}\n(Simulazione: L'API reale genererebbe un URL immagine.)"
                 generated_url = "https://via.placeholder.com/400x300?text=AI+Image"
 
@@ -421,15 +427,17 @@ class AIManager:
                 generated_text = response_ai.text.strip()
             
             elif req.content_type == ContentType.VIDEO:
+                # Note: Video generation is complex and needs specialized models. This is a text-based simulation
                 response_ai = gemini_flash_model.generate_content(f"Genera una breve sceneggiatura o un'idea per un video di 15-30 secondi basata su: '{req.prompt}'.")
                 generated_text = f"Sceneggiatura video generata: {response_ai.text.strip()}\n(Simulazione: L'API reale genererebbe un URL video.)"
                 generated_url = "https://www.w3schools.com/html/mov_bbb.mp4"
 
+            # Enhanced AI strategy based on plan
             if user_plan == SubscriptionPlan.PREMIUM:
-                strategy_response = gemini_flash_model.generate_content(f"Espandi il piano di viralità per '{req.prompt}' e '{req.content_type.value}' con 3-5 strategie di marketing digitale e consigli per l'engagement sui social. Evidenzia le parole chiave.")
+                strategy_response = gemini_flash_model.generate_content(f"Expand the virality plan for '{req.prompt}' and '{req.content_type.value}' with 3-5 digital marketing strategies and social engagement tips. Highlight keywords.")
                 ai_strategy_plan = strategy_response.text.strip()
             elif user_plan == SubscriptionPlan.ASSISTANT:
-                strategy_response = gemini_flash_model.generate_content(f"Agisci come consulente di marketing esperto. Crea un PIANO VIRALE AVANZATO dettagliato per il contenuto '{req.prompt}' ({req.content_type.value}), includendo analisi del target, canali di distribuzione (Zenith Rewards e social esterni), calendario di pubblicazione suggerito, idee per collaborazioni, ottimizzazione SEO/hashtag e misurazione dei risultati. Pensa come un growth hacker.")
+                strategy_response = gemini_flash_model.generate_content(f"Act as an expert marketing consultant. Create a DETAILED ADVANCED VIRAL PLAN for the content '{req.prompt}' ({req.content_type.value}), including target analysis, distribution channels (Zenith Rewards and external social media), suggested publication calendar, collaboration ideas, SEO/hashtag optimization, and results measurement. Think like a growth hacker.")
                 ai_strategy_plan = strategy_response.text.strip()
 
             insert_data = {
@@ -450,6 +458,7 @@ class AIManager:
             ai_content_id = content_res[0]['id'] if content_res else None
             
             if not ai_content_id:
+                logger.error("Failed to retrieve ID of generated AI content after insertion.")
                 raise Exception("Failed to retrieve ID of generated AI content.")
 
             if req.payment_method == 'points':
@@ -481,12 +490,12 @@ class AIManager:
             }
 
         except PostgrestAPIError as e:
-            logger.error(f"Supabase API Error during AI content generation: {e.code}: {e.message} - {e.details}")
-            if "Punti insufficienti" in e.message: # Custom message from RPC
+            logger.error(f"Supabase API Error during AI content generation: {e.code}: {e.message} - {e.details}", exc_info=True)
+            if "Punti insufficienti" in e.message:
                 raise HTTPException(status_code=402, detail="Punti insufficienti per la generazione AI.")
             raise HTTPException(status_code=400, detail=f"Database error during AI generation: {e.message}. Hint: {e.details}")
         except Exception as e:
-            logger.error(f"Unexpected error during AI content generation for user {req.user_id}: {e}")
+            logger.error(f"Unexpected error during AI content generation for user {req.user_id}: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Errore durante la generazione AI: {e}. Riprova più tardi.")
 
     def publish_ai_content(self, ai_content_id: int):
@@ -595,6 +604,7 @@ class ContestManager:
     def get_current_contest(self, user_plan: SubscriptionPlan):
         logger.info(f"Fetching current contest for plan: {user_plan.value}")
         now = datetime.now(timezone.utc)
+        # Using _execute_supabase_query with raise_http_exception=False to handle "not found" gracefully
         result = UserManager(self.supabase)._execute_supabase_query(
             self.supabase.table('contests').select('*') \
                 .lte('start_date', now.isoformat()) \
@@ -602,12 +612,13 @@ class ContestManager:
                 .contains('min_plan_access', [user_plan.value]) \
                 .order('end_date', desc=False) \
                 .limit(1).maybe_single(),
-            f"fetch current contest for plan {user_plan.value}"
+            f"fetch current contest for plan {user_plan.value}",
+            raise_http_exception=False # Don't raise 400 here if contest not found, just return None
         )
         
         if result: # result is the data itself, not a response object
             result['reward_pool_euro'] = self.CONTEST_REWARD_POOLS.get(user_plan, 0.00)
-            logger.info(f"Found active contest: {result['theme_prompt']}")
+            logger.info(f"Found active contest: {result['theme_prompt']} for plan {user_plan.value}")
             return result
         logger.info(f"No active contest found for plan {user_plan.value}.")
         return None
@@ -635,7 +646,7 @@ class ShopManager:
 
     async def buy_item(self, req: ShopBuyRequest):
         logger.info(f"User {req.user_id} attempting to buy item {req.item_id} with {req.payment_method}.")
-        user_profile = UserManager(self.supabase).get_user_profile(req.user_id)
+        user_profile = UserManager(self.supabase).get_user_profile(req.user_id) # This call could raise if user not found
         item = UserManager(self.supabase)._execute_supabase_query(
             self.supabase.table('shop_items').select('*').eq('id', req.item_id).maybe_single(),
             f"fetch shop item {req.item_id}"
@@ -683,16 +694,26 @@ class ShopManager:
                 return {"payment_required": True, "client_secret": payment_intent.client_secret, "message": "Procedi al pagamento Stripe."}
 
             except stripe.error.StripeError as e:
-                logger.error(f"Stripe error during Payment Intent creation: {e.user_message}")
+                logger.error(f"Stripe error during Payment Intent creation: {e.user_message}", exc_info=True)
                 raise HTTPException(status_code=500, detail=f"Errore Stripe: {e.user_message}")
             except Exception as e:
-                logger.error(f"Unexpected error creating Payment Intent: {e}")
+                logger.error(f"Unexpected error creating Payment Intent: {e}", exc_info=True)
                 raise HTTPException(status_code=500, detail=f"Errore nella creazione del Payment Intent: {e}")
 
     async def _apply_item_effect(self, user_id: str, item: dict, payment_method: str, amount_points: float | None, amount_eur: float | None):
         logger.info(f"Applying effect for item {item['name']} to user {user_id}. Type: {item['item_type']}")
+        
+        # This is where you'd implement the actual effect of the item.
+        # For a "20% earnings boost", you'd store this in a 'user_boosts' table
+        # and then apply the multiplier when calculating earnings for offers/missions.
         if item['item_type'] == ItemType.BOOST.value:
-            logger.info(f"Boost '{item['name']}' applied to user {user_id}. Effect: {item.get('effect')}")
+            effect_data = json.loads(item.get('effect', '{}'))
+            multiplier = effect_data.get('multiplier', 1.0)
+            duration_hours = effect_data.get('duration_hours', 0)
+            
+            # Here, you'd insert a record into a new 'user_active_boosts' table (not yet defined in schema)
+            # Example: self.supabase.table('user_active_boosts').insert({'user_id': user_id, 'boost_id': item['id'], 'multiplier': multiplier, 'expires_at': datetime.now(timezone.utc) + timedelta(hours=duration_hours)}).execute()
+            logger.info(f"Boost '{item['name']}' ({multiplier}x for {duration_hours}h) applied to user {user_id}. Actual effect implementation needed!")
         
         elif item['item_type'] == ItemType.COSMETIC.value:
             logger.info(f"Cosmetic '{item['name']}' applied to user {user_id}. Effect: {item.get('effect')}")
@@ -709,7 +730,7 @@ class ShopManager:
                     current_generations_used = user_res['daily_ai_generations_used']
                     UserManager(self.supabase)._execute_supabase_query(
                         self.supabase.table('users').update({
-                            'daily_ai_generations_used': current_generations_used - generations_to_add # Allows more generations by reducing the count
+                            'daily_ai_generations_used': current_generations_used - generations_to_add
                         }).eq('user_id', user_id),
                         "update user daily generations with item effect"
                     )
@@ -743,7 +764,7 @@ def sync_user_endpoint(user_data: UserSyncRequest, user_manager: UserManager = D
     try:
         return user_manager.sync_user(user_data)
     except HTTPException as e:
-        logger.error(f"HTTPException in sync_user_endpoint: {e.detail}")
+        logger.error(f"HTTPException in sync_user_endpoint: {e.detail}", exc_info=True)
         raise e
     except Exception as e:
         logger.critical(f"Unhandled exception in sync_user_endpoint for user {user_data.user_id}: {e}", exc_info=True)
@@ -762,9 +783,9 @@ def update_profile_endpoint(user_id: str, profile_data: UserProfileUpdate, user_
 def request_payout_endpoint(payout_data: PayoutRequest, user_manager: UserManager = Depends(get_user_manager)):
     logger.info(f"Payout request from user {payout_data.user_id} for {payout_data.points_amount} points.")
     try:
-        supabase = get_supabase_client()
+        supabase = get_supabase_client() # Get a fresh client for RPC, ensuring correct API key usage
         value_eur = payout_data.points_amount / POINTS_TO_EUR_RATE
-        result = UserManager(supabase)._execute_supabase_query(
+        result = user_manager._execute_supabase_query( # Using user_manager's _execute_supabase_query
             supabase.rpc('request_payout_function', { 
                 'p_user_id': payout_data.user_id, 
                 'p_points_amount': payout_data.points_amount, 
@@ -785,7 +806,7 @@ def request_payout_endpoint(payout_data: PayoutRequest, user_manager: UserManage
     except HTTPException as e:
         if 'Punti insufficienti' in e.detail:
             raise HTTPException(status_code=402, detail="Punti insufficienti per il prelievo.")
-        logger.error(f"HTTPException in request_payout_endpoint: {e.detail}")
+        logger.error(f"HTTPException in request_payout_endpoint: {e.detail}", exc_info=True)
         raise e
     except Exception as e:
         logger.critical(f"Unhandled exception in request_payout_endpoint for user {payout_data.user_id}: {e}", exc_info=True)
@@ -893,7 +914,7 @@ async def vote_content_endpoint(content_id: int, req: VoteContentRequest, ai_man
 @app.get("/contests/current/{user_id}")
 def get_current_contest_endpoint(user_id: str, contest_manager: ContestManager = Depends(get_contest_manager), user_manager: UserManager = Depends(get_user_manager)):
     try:
-        user_profile = user_manager.get_user_profile(user_id)
+        user_profile = user_manager.get_user_profile(user_id) # This will fetch profile data or return defaults
         user_plan = SubscriptionPlan(user_profile.get('subscription_plan', SubscriptionPlan.FREE.value))
         contest = contest_manager.get_current_contest(user_plan)
         if not contest:
@@ -993,7 +1014,7 @@ async def stripe_webhook(request: Request, supabase: Client = Depends(get_supaba
         logger.error(f"Invalid signature for Stripe webhook: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid signature: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error processing Stripe webhook event: {e}")
+        logger.error(f"Unexpected error processing Stripe webhook event: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=f"Webhook error: {e}")
 
     event_type = event['type']
