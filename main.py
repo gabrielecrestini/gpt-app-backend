@@ -2,9 +2,10 @@ import os
 from datetime import datetime, timezone
 import json
 from enum import Enum
+from typing import Literal # Importazione aggiunta
 
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
@@ -111,7 +112,7 @@ class AIGenerationRequest(BaseModel):
     user_id: str
     prompt: str
     content_type: ContentType
-    payment_method: 'points' | 'stripe'
+    payment_method: Literal['points', 'stripe'] # Modifica applicata qui
     contest_id: int | None = None
 
 class VoteContentRequest(BaseModel):
@@ -126,7 +127,7 @@ class CreateSubscriptionRequest(BaseModel):
 class ShopBuyRequest(BaseModel):
     user_id: str
     item_id: int
-    payment_method: 'points' | 'stripe'
+    payment_method: Literal['points', 'stripe'] # Potrebbe essere utile anche qui
 
 def get_supabase_client() -> Client:
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -785,7 +786,6 @@ async def stripe_webhook(request: Request, supabase: Client = Depends(get_supaba
             if item_res.data:
                 item = item_res.data
                 shop_manager = ShopManager(supabase)
-                # Passa i dettagli del pagamento a _apply_item_effect per registrarli
                 await shop_manager._apply_item_effect(user_id, item, 'stripe', None, item['price_eur'])
             else:
                 print(f"Warning: Item {item_id} not found for successful payment intent for user {user_id}.")
