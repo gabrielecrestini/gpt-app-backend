@@ -1,27 +1,29 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import json
 from enum import Enum
-from typing import Literal, Dict, Any, List
+from typing import Literal, Dict, Any, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from pydantic import BaseModel, Field
-from supabase import create_client, Client
-from supabase.lib.client_options import ClientOptions
-from postgrest.exceptions import APIError as PostgrestAPIError
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 import stripe
 import vertexai
 from vertexai.generative_models import GenerativeModel, Part, Image
 
+# Import per PostgreSQL diretto
+import psycopg2
+from psycopg2 import Error as Psycopg2Error
+from psycopg2.extras import DictCursor # Per ottenere risultati come dizionari
+
 # --- Initial Configuration ---
 load_dotenv()
 
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+# DATABASE_URL sarà fornito da Railway/Neon
+DATABASE_URL = os.environ.get("DATABASE_URL")
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 GCP_REGION = os.environ.get("GCP_REGION")
 GCP_SA_KEY_JSON_STR = os.environ.get("GCP_SA_KEY_JSON")
@@ -140,140 +142,170 @@ class ShopBuyRequest(BaseModel):
     item_id: int
     payment_method: Literal['points', 'stripe']
 
-def get_supabase_client() -> Client:
+# --- Database Connection (PostgreSQL with psycopg2) ---
+def get_pg_connection():
+    """Provides a psycopg2 connection to PostgreSQL."""
     try:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            raise ValueError("Supabase credentials not configured.")
-        options = ClientOptions(postgrest_client_timeout=15, storage_client_timeout=15, headers={"apikey": SUPABASE_KEY}) # Added headers to ensure key is sent
-        return create_client(SUPABASE_URL, SUPABASE_KEY, options=options)
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    except Psycopg2Error as e:
+        logger.critical(f"Failed to connect to PostgreSQL database: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database connection failed: {e}")
     except Exception as e:
-        logger.critical(f"Failed to create Supabase client: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Supabase client initialization failed: {e}")
+        logger.critical(f"Unexpected error during DB connection: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+
+def _execute_pg_query(sql_query: str, params: Optional[Tuple] = None, fetch_one: bool = False, fetch_all: bool = False, error_context: str = "database operation"):
+    """
+    Executes a PostgreSQL query and handles transactions.
+    Returns fetched data or None. Raises HTTPException on error.
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_pg_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor) # Use DictCursor for dictionary results
+        logger.debug(f"Executing SQL: {sql_query} with params: {params}")
+
+        if params:
+            cursor.execute(sql_query, params)
+        else:
+            cursor.execute(sql_query)
+
+        conn.commit() # Commit transaction for DML operations (INSERT, UPDATE, DELETE)
+
+        if fetch_one:
+            return cursor.fetchone()
+        if fetch_all:
+            return cursor.fetchall()
+        return None # For INSERT/UPDATE/DELETE that don't need results
+
+    except Psycopg2Error as e:
+        if conn:
+            conn.rollback() # Rollback on error
+        logger.error(f"PostgreSQL Error ({error_context}): Code={e.pgcode}, Message={e.pgerror.strip()}", exc_info=True)
+        # Rilancia un errore HTTP generico o più specifico se il codice errore lo permette
+        raise HTTPException(status_code=400, detail=f"Database error ({error_context}): {e.pgerror.strip()}")
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Unexpected error during PostgreSQL operation ({error_context}): {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error during {error_context}.")
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+# --- Managers (Adapted for psycopg2) ---
 
 class UserManager:
-    def __init__(self, supabase: Client): self.supabase = supabase
-
-    def _execute_supabase_query(self, query_builder, error_context: str, raise_http_exception: bool = True) -> Any:
-        try:
-            result = query_builder.execute()
-            if hasattr(result, 'data'):
-                return result.data
-            return result
-        except PostgrestAPIError as e:
-            logger.error(f"Supabase API Error in UserManager ({error_context}): Code={e.code}, Message={e.message}, Details={e.details}", exc_info=True)
-            if raise_http_exception:
-                raise HTTPException(status_code=400, detail=f"Database error ({error_context}): {e.message}. Hint: {e.details}")
-            return None # Return None if not raising, for graceful handling
-        except Exception as e:
-            logger.error(f"Unexpected error in UserManager ({error_context}): {e}", exc_info=True)
-            if raise_http_exception:
-                raise HTTPException(status_code=500, detail=f"Internal server error during {error_context}.")
-            return None # Return None if not raising
+    def __init__(self): pass
 
     def sync_user(self, user_data: UserSyncRequest):
         now = datetime.now(timezone.utc)
         logger.info(f"Attempting to sync user: {user_data.user_id}")
         
-        user_record = self._execute_supabase_query(
-            self.supabase.table('users').select('user_id, last_login_at, login_streak, daily_ai_generations_used, last_generation_reset_date, daily_votes_used, last_vote_reset_date').eq('user_id', user_data.user_id).maybe_single(),
-            "user sync fetch",
-            raise_http_exception=False # Don't raise immediately, handle if user not found
+        user_record = _execute_pg_query(
+            "SELECT user_id, last_login_at, login_streak, daily_ai_generations_used, last_generation_reset_date, daily_votes_used, last_vote_reset_date FROM users WHERE user_id = %s",
+            (user_data.user_id,), fetch_one=True, error_context="user sync fetch"
         )
         
         if not user_record:
             logger.info(f"Creating new user: {user_data.user_id}")
-            new_user_record = {
-                'user_id': user_data.user_id,
-                'email': user_data.email,
-                'display_name': user_data.displayName,
-                'referrer_id': user_data.referrer_id,
-                'avatar_url': user_data.avatar_url,
-                'login_streak': 1,
-                'last_login_at': now.isoformat(),
-                'points_balance': 0,
-                'pending_points_balance': 0,
-                'subscription_plan': SubscriptionPlan.FREE.value,
-                'daily_ai_generations_used': 0,
-                'last_generation_reset_date': now.isoformat(),
-                'daily_votes_used': 0,
-                'last_vote_reset_date': now.isoformat()
-            }
-            self._execute_supabase_query(
-                self.supabase.table('users').insert(new_user_record),
-                "insert new user"
+            _execute_pg_query(
+                """
+                INSERT INTO users (user_id, email, display_name, referrer_id, avatar_url, login_streak, last_login_at, points_balance, pending_points_balance, subscription_plan, daily_ai_generations_used, last_generation_reset_date, daily_votes_used, last_vote_reset_date, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (user_data.user_id, user_data.email, user_data.displayName, user_data.referrer_id, user_data.avatar_url, 1, now, 0, 0, SubscriptionPlan.FREE.value, 0, now, 0, now, now),
+                error_context="insert new user"
             )
             logger.info(f"New user {user_data.user_id} created successfully.")
         else:
             logger.info(f"Updating existing user: {user_data.user_id}")
-            last_login_str = user_record.get('last_login_at')
-            current_streak = user_record.get('login_streak', 0)
+            # Ensure datetime objects are passed, psycopg2 handles conversion
+            last_login_dt = user_record['last_login_at'] if user_record['last_login_at'] else now
+            current_streak = user_record['login_streak'] if user_record['login_streak'] is not None else 0
             
             new_streak = 1
-            if last_login_str:
-                last_login_date = datetime.fromisoformat(last_login_str).date()
+            if last_login_dt:
+                last_login_date_only = last_login_dt.date()
                 today = now.date()
-                days_diff = (today - last_login_date).days
+                days_diff = (today - last_login_date_only).days
 
                 if days_diff == 1:
                     new_streak = current_streak + 1
                 elif days_diff == 0:
                     new_streak = current_streak
             
-            update_data: Dict[str, Any] = {'last_login_at': now.isoformat(), 'login_streak': new_streak}
+            update_data_params = [now, new_streak] # Order matters for SQL query
             
-            last_gen_reset_date_str = user_record.get('last_generation_reset_date')
-            last_gen_reset_date = datetime.fromisoformat(last_gen_reset_date_str).date() if last_gen_reset_date_str else now.date()
-            if now.date() > last_gen_reset_date:
-                update_data['daily_ai_generations_used'] = 0
-                update_data['last_generation_reset_date'] = now.isoformat()
-            
-            last_vote_reset_date_str = user_record.get('last_vote_reset_date')
-            last_vote_reset_date = datetime.fromisoformat(last_vote_reset_date_str).date() if last_vote_reset_date_str else now.date()
-            if now.date() > last_vote_reset_date:
-                update_data['daily_votes_used'] = 0
-                update_data['last_vote_reset_date'] = now.isoformat()
+            daily_ai_generations_used_val = user_record['daily_ai_generations_used']
+            last_generation_reset_date_val = user_record['last_generation_reset_date']
 
-            self._execute_supabase_query(
-                self.supabase.table('users').update(update_data).eq('user_id', user_data.user_id),
-                "update existing user"
+            if now.date() > (last_generation_reset_date_val.date() if last_generation_reset_date_val else now.date()):
+                daily_ai_generations_used_val = 0
+                last_generation_reset_date_val = now
+            
+            update_data_params.extend([daily_ai_generations_used_val, last_generation_reset_date_val])
+
+            daily_votes_used_val = user_record['daily_votes_used']
+            last_vote_reset_date_val = user_record['last_vote_reset_date']
+            if now.date() > (last_vote_reset_date_val.date() if last_vote_reset_date_val else now.date()):
+                daily_votes_used_val = 0
+                last_vote_reset_date_val = now
+
+            update_data_params.extend([daily_votes_used_val, last_vote_reset_date_val])
+            update_data_params.append(user_data.user_id) # Final parameter for WHERE clause
+
+            _execute_pg_query(
+                "UPDATE users SET last_login_at = %s, login_streak = %s, daily_ai_generations_used = %s, last_generation_reset_date = %s, daily_votes_used = %s, last_vote_reset_date = %s WHERE user_id = %s",
+                tuple(update_data_params), error_context="update existing user"
             )
             logger.info(f"User {user_data.user_id} updated successfully.")
         return {"status": "success"}
 
     def update_profile(self, user_id: str, profile_data: UserProfileUpdate):
         logger.info(f"Updating profile for user: {user_id}")
-        update_payload = profile_data.model_dump(exclude_unset=True)
-        if not update_payload: 
+        update_payload_items = []
+        update_values = []
+        if profile_data.display_name is not None:
+            update_payload_items.append("display_name = %s")
+            update_values.append(profile_data.display_name)
+        if profile_data.avatar_url is not None:
+            update_payload_items.append("avatar_url = %s")
+            update_values.append(profile_data.avatar_url)
+        
+        if not update_payload_items: 
             logger.warning(f"No data provided for profile update for user {user_id}")
             raise HTTPException(status_code=400, detail="No data provided to update.")
         
-        self._execute_supabase_query(
-            self.supabase.table('users').update(update_payload).eq('user_id', user_id),
-            "update user profile"
-        )
+        sql_query = f"UPDATE users SET {', '.join(update_payload_items)} WHERE user_id = %s"
+        update_values.append(user_id)
+
+        _execute_pg_query(sql_query, tuple(update_values), error_context="update user profile")
         logger.info(f"Profile for user {user_id} updated successfully.")
         return {"status": "success", "message": "Profile updated successfully."}
 
     def get_user_balance(self, user_id: str):
         logger.info(f"Fetching balance for user: {user_id}")
-        response_data = self._execute_supabase_query(
-            self.supabase.table('users').select('points_balance, pending_points_balance').eq('user_id', user_id).maybe_single(),
-            "fetch user balance"
+        user_record = _execute_pg_query(
+            "SELECT points_balance, pending_points_balance FROM users WHERE user_id = %s",
+            (user_id,), fetch_one=True, error_context="fetch user balance"
         )
-        if not response_data:
+        if not user_record:
             logger.warning(f"User {user_id} not found when fetching balance.")
             raise HTTPException(status_code=404, detail="User not found.")
-        return response_data
+        return user_record
 
     def get_user_profile(self, user_id: str):
         logger.info(f"Fetching profile for user: {user_id}")
-        response_data = self._execute_supabase_query(
-            self.supabase.table('users').select(
-                'subscription_plan, daily_ai_generations_used, last_generation_reset_date, daily_votes_used, last_vote_reset_date, points_balance'
-            ).eq('user_id', user_id).maybe_single(),
-            "fetch user profile"
+        user_record = _execute_pg_query(
+            "SELECT subscription_plan, daily_ai_generations_used, last_generation_reset_date, daily_votes_used, last_vote_reset_date, points_balance, stripe_customer_id FROM users WHERE user_id = %s",
+            (user_id,), fetch_one=True, error_context="fetch user profile"
         )
-        if not response_data:
+        if not user_record:
             logger.warning(f"User {user_id} not found when fetching profile. Returning default data.")
             return {
                 "subscription_plan": SubscriptionPlan.FREE.value,
@@ -281,48 +313,56 @@ class UserManager:
                 "last_generation_reset_date": datetime.now(timezone.utc).isoformat(),
                 "daily_votes_used": 0,
                 "last_vote_reset_date": datetime.now(timezone.utc).isoformat(),
-                "points_balance": 0
+                "points_balance": 0,
+                "stripe_customer_id": None # Add stripe_customer_id to default
             }
-        return response_data
+        # Convert datetime objects to ISO format strings for consistency
+        user_record['last_generation_reset_date'] = user_record['last_generation_reset_date'].isoformat() if user_record['last_generation_reset_date'] else None
+        user_record['last_vote_reset_date'] = user_record['last_vote_reset_date'].isoformat() if user_record['last_vote_reset_date'] else None
+        # Ensure subscription_plan and other nullable fields are handled
+        user_record['subscription_plan'] = user_record['subscription_plan'] if user_record['subscription_plan'] else SubscriptionPlan.FREE.value
+        user_record['stripe_customer_id'] = user_record['stripe_customer_id']
+        return user_record
 
     def get_streak_status(self, user_id: str):
         logger.info(f"Fetching streak status for user: {user_id}")
-        response_data = self._execute_supabase_query(
-            self.supabase.table('users').select('login_streak').eq('user_id', user_id).maybe_single(),
-            "fetch streak status"
+        user_record = _execute_pg_query(
+            "SELECT login_streak FROM users WHERE user_id = %s",
+            (user_id,), fetch_one=True, error_context="fetch streak status"
         )
-        if not response_data: 
+        if not user_record:
             logger.warning(f"User {user_id} not found when fetching streak. Returning 0.")
             return {"login_streak": 0}
-        return response_data
+        
+        login_streak = user_record['login_streak'] if user_record['login_streak'] is not None else 0
+        return {"login_streak": login_streak}
 
     def claim_streak_reward(self, user_id: str):
         logger.info(f"Attempting to claim streak reward for user: {user_id}")
-        result_data = self._execute_supabase_query(
-            self.supabase.rpc('claim_streak_reward', {'p_user_id': user_id}),
-            "claim streak RPC"
+        # Call the SQL function directly
+        result_data = _execute_pg_query(
+            "SELECT claim_streak_reward(%s) AS result",
+            (user_id,), fetch_one=True, error_context="claim streak RPC"
         )
-        if result_data and isinstance(result_data, list) and len(result_data) > 0:
-            return result_data[0]
-        elif result_data and isinstance(result_data, dict):
-             return result_data
+        if result_data and result_data['result']: # The function returns jsonb
+            return result_data['result']
         logger.error(f"Unexpected RPC return for claim_streak_reward for user {user_id}: {result_data}")
         raise HTTPException(status_code=400, detail="Failed to claim streak reward. Check database function logs for details.")
 
     def get_referral_stats(self, user_id: str):
         logger.info(f"Fetching referral stats for user: {user_id}")
-        referral_count_res = self._execute_supabase_query(
-            self.supabase.table('users').select('count').eq('referrer_id', user_id).maybe_single(),
-            "fetch referral count"
+        referral_count_res = _execute_pg_query(
+            "SELECT COUNT(*) FROM users WHERE referrer_id = %s",
+            (user_id,), fetch_one=True, error_context="fetch referral count"
         )
-        referral_count = referral_count_res['count'] if referral_count_res else 0
+        referral_count = referral_count_res['count'] if referral_count_res and 'count' in referral_count_res else 0
 
         referral_earnings = referral_count * 100
         logger.info(f"Referral stats for {user_id}: count={referral_count}, earnings={referral_earnings}")
         return {"referral_count": referral_count, "referral_earnings": referral_earnings}
 
 class AIManager:
-    def __init__(self, supabase: Client): self.supabase = supabase
+    def __init__(self): pass
 
     AI_GENERATION_LIMITS = {
         SubscriptionPlan.FREE: 3,
@@ -349,19 +389,17 @@ class AIManager:
             logger.error("AI service (Gemini Flash) is not available.")
             raise HTTPException(status_code=503, detail="AI service (Gemini Flash) is not available or not initialized.")
 
-        user_profile = UserManager(self.supabase).get_user_profile(req.user_id)
+        user_manager = UserManager() # Create manager instance for profile access
+        user_profile = user_manager.get_user_profile(req.user_id)
         user_plan = SubscriptionPlan(user_profile.get('subscription_plan', SubscriptionPlan.FREE.value))
         generations_used = user_profile.get('daily_ai_generations_used', 0)
-        last_reset_str = user_profile.get('last_generation_reset_date', datetime.now(timezone.utc).isoformat())
+        last_reset_dt = datetime.fromisoformat(user_profile.get('last_generation_reset_date', datetime.now(timezone.utc).isoformat()))
         
-        if datetime.fromisoformat(last_reset_str).date() < datetime.now(timezone.utc).date():
+        if datetime.now(timezone.utc).date() > last_reset_dt.date():
             generations_used = 0
-            UserManager(self.supabase)._execute_supabase_query(
-                self.supabase.table('users').update({
-                    'daily_ai_generations_used': 0,
-                    'last_generation_reset_date': datetime.now(timezone.utc).isoformat()
-                }).eq('user_id', req.user_id),
-                "reset daily AI generations"
+            _execute_pg_query(
+                "UPDATE users SET daily_ai_generations_used = %s, last_generation_reset_date = %s WHERE user_id = %s",
+                (0, datetime.now(timezone.utc), req.user_id), error_context="reset daily AI generations"
             )
 
         if generations_used >= self.AI_GENERATION_LIMITS.get(user_plan, 0):
@@ -379,11 +417,9 @@ class AIManager:
             response_ai = gemini_flash_model.generate_content(final_prompt)
             generated_text = response_ai.text.strip()
 
-            UserManager(self.supabase)._execute_supabase_query(
-                self.supabase.table('users').update({
-                    'daily_ai_generations_used': generations_used + 1
-                }).eq('user_id', req.user_id),
-                "increment daily AI generations"
+            _execute_pg_query(
+                "UPDATE users SET daily_ai_generations_used = %s WHERE user_id = %s",
+                (generations_used + 1, req.user_id), error_context="increment daily AI generations"
             )
             logger.info(f"AI advice generated and usage incremented for user {req.user_id}.")
             return {"advice": generated_text}
@@ -396,7 +432,8 @@ class AIManager:
             logger.error("AI service is not available for content generation.")
             raise HTTPException(status_code=503, detail="AI service is not available.")
 
-        user_profile = UserManager(self.supabase).get_user_profile(req.user_id)
+        user_manager = UserManager()
+        user_profile = user_manager.get_user_profile(req.user_id)
         user_plan = SubscriptionPlan(user_profile.get('subscription_plan', SubscriptionPlan.FREE.value))
         
         cost = self.get_ai_cost(user_plan)
@@ -404,9 +441,9 @@ class AIManager:
         if req.payment_method == 'points':
             if user_profile['points_balance'] < cost['points']:
                 logger.warning(f"User {req.user_id} has insufficient points ({user_profile['points_balance']}) for AI content generation (needed {cost['points']}).")
-                raise HTTPException(status_code=402, detail=f"Punti insufficienti. Hai bisogno di {cost['points']} ZC.")
+                raise HTTPException(status_code=402, detail="Punti insufficienti. Hai bisogno di {cost['points']} ZC.")
         elif req.payment_method == 'stripe':
-            pass # Stripe payment intent will be created later
+            pass
 
         generated_url = None
         generated_text = None
@@ -417,7 +454,6 @@ class AIManager:
             if req.content_type == ContentType.IMAGE:
                 if not gemini_pro_vision_model:
                      raise HTTPException(status_code=503, detail="AI image generation model not available.")
-                # Note: Direct image generation might need dedicated services like Imagen or DALL-E, this is a text-based simulation
                 image_response = gemini_pro_vision_model.generate_content(f"Create a short text description and visual suggestion for an image based on: '{req.prompt}'.")
                 generated_text = f"Immagine generata: {image_response.text.strip()}\n(Simulazione: L'API reale genererebbe un URL immagine.)"
                 generated_url = "https://via.placeholder.com/400x300?text=AI+Image"
@@ -427,12 +463,10 @@ class AIManager:
                 generated_text = response_ai.text.strip()
             
             elif req.content_type == ContentType.VIDEO:
-                # Note: Video generation is complex and needs specialized models. This is a text-based simulation
                 response_ai = gemini_flash_model.generate_content(f"Genera una breve sceneggiatura o un'idea per un video di 15-30 secondi basata su: '{req.prompt}'.")
                 generated_text = f"Sceneggiatura video generata: {response_ai.text.strip()}\n(Simulazione: L'API reale genererebbe un URL video.)"
                 generated_url = "https://www.w3schools.com/html/mov_bbb.mp4"
 
-            # Enhanced AI strategy based on plan
             if user_plan == SubscriptionPlan.PREMIUM:
                 strategy_response = gemini_flash_model.generate_content(f"Expand the virality plan for '{req.prompt}' and '{req.content_type.value}' with 3-5 digital marketing strategies and social engagement tips. Highlight keywords.")
                 ai_strategy_plan = strategy_response.text.strip()
@@ -440,43 +474,31 @@ class AIManager:
                 strategy_response = gemini_flash_model.generate_content(f"Act as an expert marketing consultant. Create a DETAILED ADVANCED VIRAL PLAN for the content '{req.prompt}' ({req.content_type.value}), including target analysis, distribution channels (Zenith Rewards and external social media), suggested publication calendar, collaboration ideas, SEO/hashtag optimization, and results measurement. Think like a growth hacker.")
                 ai_strategy_plan = strategy_response.text.strip()
 
-            insert_data = {
-                'user_id': req.user_id,
-                'contest_id': req.contest_id,
-                'prompt': req.prompt,
-                'content_type': req.content_type.value,
-                'generated_url': generated_url,
-                'generated_text': generated_text,
-                'ai_strategy_plan': ai_strategy_plan,
-                'is_published': False,
-                'votes': 0
-            }
-            content_res = UserManager(self.supabase)._execute_supabase_query(
-                self.supabase.table('ai_contents').insert(insert_data),
-                "insert AI content"
+            content_id_row = _execute_pg_query(
+                """
+                INSERT INTO ai_contents (user_id, contest_id, prompt, content_type, generated_url, generated_text, ai_strategy_plan, is_published, votes, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (req.user_id, req.contest_id, req.prompt, req.content_type.value, generated_url, generated_text, ai_strategy_plan, False, 0, datetime.now(timezone.utc)),
+                fetch_one=True, error_context="insert AI content"
             )
-            ai_content_id = content_res[0]['id'] if content_res else None
+            ai_content_id = content_id_row['id'] if content_id_row else None
             
             if not ai_content_id:
                 logger.error("Failed to retrieve ID of generated AI content after insertion.")
                 raise Exception("Failed to retrieve ID of generated AI content.")
 
             if req.payment_method == 'points':
-                UserManager(self.supabase)._execute_supabase_query(
-                    self.supabase.rpc('deduct_points', {
-                        'p_user_id': req.user_id,
-                        'p_amount': cost['points'],
-                        'p_reason': f'AI Generation - {req.content_type.value}'
-                    }),
-                    "deduct points for AI generation"
+                _execute_pg_query(
+                    "SELECT deduct_points(%s, %s, %s) AS result", # Call SQL function
+                    (req.user_id, cost['points'], f'AI Generation - {req.content_type.value}'),
+                    error_context="deduct points for AI generation"
                 )
             
-            UserManager(self.supabase)._execute_supabase_query(
-                self.supabase.table('users').update({
-                    'daily_ai_generations_used': user_profile['daily_ai_generations_used'] + 1,
-                    'last_content_generated_id': ai_content_id
-                }).eq('user_id', req.user_id),
-                "increment AI generations usage"
+            _execute_pg_query(
+                "UPDATE users SET daily_ai_generations_used = daily_ai_generations_used + 1, last_content_generated_id = %s WHERE user_id = %s",
+                (ai_content_id, req.user_id), error_context="increment AI generations usage"
             )
             logger.info(f"AI content generated and usage incremented for user {req.user_id}. Content ID: {ai_content_id}")
             return {
@@ -489,31 +511,33 @@ class AIManager:
                 "payment_required": False
             }
 
-        except PostgrestAPIError as e:
-            logger.error(f"Supabase API Error during AI content generation: {e.code}: {e.message} - {e.details}", exc_info=True)
-            if "Punti insufficienti" in e.message:
-                raise HTTPException(status_code=402, detail="Punti insufficienti per la generazione AI.")
-            raise HTTPException(status_code=400, detail=f"Database error during AI generation: {e.message}. Hint: {e.details}")
         except Exception as e:
-            logger.error(f"Unexpected error during AI content generation for user {req.user_id}: {e}", exc_info=True)
+            logger.error(f"Error during AI content generation for user {req.user_id}: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Errore durante la generazione AI: {e}. Riprova più tardi.")
 
     def publish_ai_content(self, ai_content_id: int):
         logger.info(f"Publishing AI content: {ai_content_id}")
-        UserManager(self.supabase)._execute_supabase_query(
-            self.supabase.table('ai_contents').update({'is_published': True}).eq('id', ai_content_id),
-            "publish AI content"
+        _execute_pg_query(
+            "UPDATE ai_contents SET is_published = TRUE WHERE id = %s",
+            (ai_content_id,), error_context="publish AI content"
         )
         logger.info(f"AI content {ai_content_id} published successfully.")
         return {"status": "success", "message": "Content published successfully."}
 
     async def get_feed(self):
         logger.info("Fetching AI content feed.")
-        response = UserManager(self.supabase)._execute_supabase_query(
-            self.supabase.table('ai_contents').select(
-                'id, user_id, contest_id, prompt, content_type, generated_url, generated_text, ai_strategy_plan, votes, created_at, users(display_name, avatar_url)'
-            ).eq('is_published', True).order('votes', desc=True).order('created_at', desc=True).limit(50),
-            "fetch AI content feed"
+        response = _execute_pg_query(
+            """
+            SELECT
+                ac.id, ac.user_id, ac.contest_id, ac.prompt, ac.content_type, ac.generated_url, ac.generated_text, ac.ai_strategy_plan, ac.votes, ac.created_at,
+                u.display_name, u.avatar_url
+            FROM ai_contents ac
+            JOIN users u ON ac.user_id = u.user_id
+            WHERE ac.is_published = TRUE
+            ORDER BY ac.votes DESC, ac.created_at DESC
+            LIMIT 50
+            """,
+            fetch_all=True, error_context="fetch AI content feed"
         )
         
         formatted_feed = []
@@ -530,8 +554,8 @@ class AIManager:
                     "ai_strategy_plan": item['ai_strategy_plan'],
                     "votes": item['votes'],
                     "user": {
-                        "display_name": item['users']['display_name'],
-                        "avatar_url": item['users']['avatar_url']
+                        "display_name": item['display_name'],
+                        "avatar_url": item['avatar_url']
                     }
                 })
         logger.info(f"Fetched {len(formatted_feed)} items for AI content feed.")
@@ -539,61 +563,57 @@ class AIManager:
 
     async def vote_content(self, content_id: int, user_id: str):
         logger.info(f"User {user_id} attempting to vote for content {content_id}.")
-        user_profile = UserManager(self.supabase).get_user_profile(user_id)
+        user_manager = UserManager()
+        user_profile = user_manager.get_user_profile(user_id)
         user_plan = SubscriptionPlan(user_profile.get('subscription_plan', SubscriptionPlan.FREE.value))
         daily_votes_used = user_profile.get('daily_votes_used', 0)
-        last_vote_reset_date = user_profile.get('last_vote_reset_date', datetime.now(timezone.utc).isoformat())
+        last_vote_reset_dt = datetime.fromisoformat(user_profile.get('last_vote_reset_date', datetime.now(timezone.utc).isoformat()))
 
-        if datetime.fromisoformat(last_vote_reset_date).date() < datetime.now(timezone.utc).date():
+        if datetime.now(timezone.utc).date() > last_vote_reset_dt.date():
             daily_votes_used = 0
-            UserManager(self.supabase)._execute_supabase_query(
-                self.supabase.table('users').update({
-                    'daily_votes_used': 0,
-                    'last_vote_reset_date': datetime.now(timezone.utc).isoformat()
-                }).eq('user_id', user_id),
-                "reset daily votes"
+            _execute_pg_query(
+                "UPDATE users SET daily_votes_used = %s, last_vote_reset_date = %s WHERE user_id = %s",
+                (0, datetime.now(timezone.utc), user_id), error_context="reset daily votes"
             )
 
         if daily_votes_used >= self.DAILY_VOTE_LIMITS.get(user_plan, 0):
             logger.warning(f"User {user_id} exceeded daily vote limit for plan {user_plan.value}.")
             raise HTTPException(status_code=429, detail=f"Hai raggiunto il limite giornaliero di voti ({self.DAILY_VOTE_LIMITS.get(user_plan, 0)}) per il tuo piano '{user_plan.value}'.")
 
-        existing_vote = UserManager(self.supabase)._execute_supabase_query(
-            self.supabase.table('votes').select('*').eq('user_id', user_id).eq('content_id', content_id).maybe_single(),
-            "check existing vote"
+        existing_vote = _execute_pg_query(
+            "SELECT id FROM votes WHERE user_id = %s AND content_id = %s",
+            (user_id, content_id), fetch_one=True, error_context="check existing vote"
         )
         if existing_vote:
             logger.warning(f"User {user_id} already voted for content {content_id}.")
             raise HTTPException(status_code=400, detail="Hai già votato questo contenuto.")
 
-        content_owner_res = UserManager(self.supabase)._execute_supabase_query(
-            self.supabase.table('ai_contents').select('user_id').eq('id', content_id).maybe_single(),
-            "get content owner"
+        content_owner_res = _execute_pg_query(
+            "SELECT user_id FROM ai_contents WHERE id = %s",
+            (content_id,), fetch_one=True, error_context="get content owner"
         )
         if content_owner_res and content_owner_res['user_id'] == user_id:
             logger.warning(f"User {user_id} tried to vote for their own content {content_id}.")
             raise HTTPException(status_code=400, detail="Non puoi votare il tuo stesso contenuto.")
 
-        UserManager(self.supabase)._execute_supabase_query(
-            self.supabase.table('votes').insert({'user_id': user_id, 'content_id': content_id}),
-            "insert new vote"
+        _execute_pg_query(
+            "INSERT INTO votes (user_id, content_id, voted_at) VALUES (%s, %s, %s)",
+            (user_id, content_id, datetime.now(timezone.utc)), error_context="insert new vote"
         )
-        UserManager(self.supabase)._execute_supabase_query(
-            self.supabase.rpc('increment_content_votes', {'p_content_id': content_id}),
-            "increment content votes RPC"
+        _execute_pg_query(
+            "SELECT increment_content_votes(%s) AS result",
+            (content_id,), error_context="increment content votes RPC"
         )
 
-        UserManager(self.supabase)._execute_supabase_query(
-            self.supabase.table('users').update({
-                'daily_votes_used': daily_votes_used + 1
-            }).eq('user_id', user_id),
-            "increment daily votes usage"
+        _execute_pg_query(
+            "UPDATE users SET daily_votes_used = %s WHERE user_id = %s",
+            (daily_votes_used + 1, user_id), error_context="increment daily votes usage"
         )
         logger.info(f"User {user_id} successfully voted for content {content_id}.")
         return {"status": "success", "message": "Voto registrato con successo!"}
 
 class ContestManager:
-    def __init__(self, supabase: Client): self.supabase = supabase
+    def __init__(self): pass
 
     CONTEST_REWARD_POOLS = {
         SubscriptionPlan.FREE: 10.00,
@@ -604,20 +624,23 @@ class ContestManager:
     def get_current_contest(self, user_plan: SubscriptionPlan):
         logger.info(f"Fetching current contest for plan: {user_plan.value}")
         now = datetime.now(timezone.utc)
-        # Using _execute_supabase_query with raise_http_exception=False to handle "not found" gracefully
-        result = UserManager(self.supabase)._execute_supabase_query(
-            self.supabase.table('contests').select('*') \
-                .lte('start_date', now.isoformat()) \
-                .gte('end_date', now.isoformat()) \
-                .contains('min_plan_access', [user_plan.value]) \
-                .order('end_date', desc=False) \
-                .limit(1).maybe_single(),
-            f"fetch current contest for plan {user_plan.value}",
-            raise_http_exception=False # Don't raise 400 here if contest not found, just return None
+        result = _execute_pg_query(
+            """
+            SELECT id, theme_prompt, start_date, end_date, reward_pool_euro, min_plan_access, created_at
+            FROM contests
+            WHERE start_date <= %s AND end_date >= %s AND %s = ANY(min_plan_access)
+            ORDER BY end_date ASC
+            LIMIT 1
+            """,
+            (now, now, user_plan.value), fetch_one=True, error_context=f"fetch current contest for plan {user_plan.value}"
         )
         
-        if result: # result is the data itself, not a response object
+        if result:
             result['reward_pool_euro'] = self.CONTEST_REWARD_POOLS.get(user_plan, 0.00)
+            # Convert datetime objects to ISO format strings for JSON serialization
+            result['start_date'] = result['start_date'].isoformat() if result['start_date'] else None
+            result['end_date'] = result['end_date'].isoformat() if result['end_date'] else None
+            result['created_at'] = result['created_at'].isoformat() if result['created_at'] else None
             logger.info(f"Found active contest: {result['theme_prompt']} for plan {user_plan.value}")
             return result
         logger.info(f"No active contest found for plan {user_plan.value}.")
@@ -625,31 +648,43 @@ class ContestManager:
 
     def get_leaderboard(self):
         logger.info("Fetching leaderboard.")
-        response_data = UserManager(self.supabase)._execute_supabase_query(
-            self.supabase.table('users').select('display_name, avatar_url, points_balance').order('points_balance', desc=True).limit(100),
-            "fetch leaderboard"
+        response_data = _execute_pg_query(
+            "SELECT display_name, avatar_url, points_balance FROM users ORDER BY points_balance DESC LIMIT 100",
+            fetch_all=True, error_context="fetch leaderboard"
         )
         logger.info(f"Fetched {len(response_data) if response_data else 0} users for leaderboard.")
         return response_data if response_data else []
 
 class ShopManager:
-    def __init__(self, supabase: Client): self.supabase = supabase
+    def __init__(self): pass
 
     def get_shop_items(self):
         logger.info("Fetching shop items.")
-        response_data = UserManager(self.supabase)._execute_supabase_query(
-            self.supabase.table('shop_items').select('*').order('price_points', desc=False),
-            "fetch shop items"
+        response_data = _execute_pg_query(
+            "SELECT id, name, description, price_points, price_eur, item_type, effect, image_url, is_active, created_at FROM shop_items ORDER BY price_points ASC",
+            fetch_all=True, error_context="fetch shop items"
         )
         logger.info(f"Fetched {len(response_data) if response_data else 0} shop items.")
+        
+        # Convert datetime objects and ensure JSON is properly loaded/formatted
+        if response_data:
+            for item in response_data:
+                if 'effect' in item and item['effect'] is not None and not isinstance(item['effect'], dict):
+                    # psycopg2 DictCursor should handle JSONB directly, but add safeguard
+                    item['effect'] = json.loads(item['effect'])
+                if 'created_at' in item and item['created_at'] is not None:
+                    item['created_at'] = item['created_at'].isoformat()
+        
         return response_data if response_data else []
 
     async def buy_item(self, req: ShopBuyRequest):
         logger.info(f"User {req.user_id} attempting to buy item {req.item_id} with {req.payment_method}.")
-        user_profile = UserManager(self.supabase).get_user_profile(req.user_id) # This call could raise if user not found
-        item = UserManager(self.supabase)._execute_supabase_query(
-            self.supabase.table('shop_items').select('*').eq('id', req.item_id).maybe_single(),
-            f"fetch shop item {req.item_id}"
+        user_manager = UserManager()
+        user_profile = user_manager.get_user_profile(req.user_id)
+        
+        item = _execute_pg_query(
+            "SELECT id, name, description, price_points, price_eur, item_type, effect, image_url, is_active FROM shop_items WHERE id = %s",
+            (req.item_id,), fetch_one=True, error_context=f"fetch shop item {req.item_id}"
         )
         
         if not item: 
@@ -661,13 +696,10 @@ class ShopManager:
                 logger.warning(f"User {req.user_id} has insufficient points ({user_profile['points_balance']}) to buy item {req.item_id} (needed {item['price_points']}).")
                 raise HTTPException(status_code=402, detail="Punti insufficienti per l'acquisto.")
             
-            UserManager(self.supabase)._execute_supabase_query(
-                self.supabase.rpc('deduct_points', {
-                    'p_user_id': req.user_id,
-                    'p_amount': item['price_points'],
-                    'p_reason': f'Shop Purchase: {item["name"]} (Points)'
-                }),
-                "deduct points for shop item"
+            _execute_pg_query(
+                "SELECT deduct_points(%s, %s, %s) AS result", # Call SQL function
+                (req.user_id, item['price_points'], f'Shop Purchase: {item["name"]} (Points)'),
+                fetch_one=True, error_context="deduct points for shop item"
             )
 
             await self._apply_item_effect(req.user_id, item, req.payment_method, item['price_points'], None)
@@ -703,57 +735,45 @@ class ShopManager:
     async def _apply_item_effect(self, user_id: str, item: dict, payment_method: str, amount_points: float | None, amount_eur: float | None):
         logger.info(f"Applying effect for item {item['name']} to user {user_id}. Type: {item['item_type']}")
         
-        # This is where you'd implement the actual effect of the item.
-        # For a "20% earnings boost", you'd store this in a 'user_boosts' table
-        # and then apply the multiplier when calculating earnings for offers/missions.
         if item['item_type'] == ItemType.BOOST.value:
-            effect_data = json.loads(item.get('effect', '{}'))
+            effect_data = item.get('effect', {})
             multiplier = effect_data.get('multiplier', 1.0)
             duration_hours = effect_data.get('duration_hours', 0)
-            
-            # Here, you'd insert a record into a new 'user_active_boosts' table (not yet defined in schema)
-            # Example: self.supabase.table('user_active_boosts').insert({'user_id': user_id, 'boost_id': item['id'], 'multiplier': multiplier, 'expires_at': datetime.now(timezone.utc) + timedelta(hours=duration_hours)}).execute()
             logger.info(f"Boost '{item['name']}' ({multiplier}x for {duration_hours}h) applied to user {user_id}. Actual effect implementation needed!")
         
         elif item['item_type'] == ItemType.COSMETIC.value:
             logger.info(f"Cosmetic '{item['name']}' applied to user {user_id}. Effect: {item.get('effect')}")
         
         elif item['item_type'] == ItemType.GENERATION_PACK.value:
-            effect_data = json.loads(item.get('effect', '{}'))
+            effect_data = item.get('effect', {})
             generations_to_add = effect_data.get('generations', 0)
             if generations_to_add > 0:
-                user_res = UserManager(self.supabase)._execute_supabase_query(
-                    self.supabase.table('users').select('daily_ai_generations_used').eq('user_id', user_id).maybe_single(),
-                    "fetch user daily generations for item effect"
+                user_res = _execute_pg_query(
+                    "SELECT daily_ai_generations_used FROM users WHERE user_id = %s",
+                    (user_id,), fetch_one=True, error_context="fetch user daily generations for item effect"
                 )
                 if user_res:
                     current_generations_used = user_res['daily_ai_generations_used']
-                    UserManager(self.supabase)._execute_supabase_query(
-                        self.supabase.table('users').update({
-                            'daily_ai_generations_used': current_generations_used - generations_to_add
-                        }).eq('user_id', user_id),
-                        "update user daily generations with item effect"
+                    _execute_pg_query(
+                        "UPDATE users SET daily_ai_generations_used = %s WHERE user_id = %s",
+                        (current_generations_used - generations_to_add, user_id), error_context="update user daily generations with item effect"
                     )
                     logger.info(f"Added {generations_to_add} AI generations to user {user_id}.")
 
-        UserManager(self.supabase)._execute_supabase_query(
-            self.supabase.table('user_purchases').insert({
-                'user_id': user_id,
-                'item_id': item['id'],
-                'purchase_date': datetime.now(timezone.utc).isoformat(),
-                'payment_method': payment_method,
-                'amount_paid_points': amount_points,
-                'amount_paid_eur': amount_eur,
-                'status': 'completed'
-            }),
-            "log user purchase"
+        _execute_pg_query(
+            """
+            INSERT INTO user_purchases (user_id, item_id, purchase_date, payment_method, amount_paid_points, amount_paid_eur, status, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (user_id, item['id'], datetime.now(timezone.utc), payment_method, amount_points, amount_eur, 'completed', datetime.now(timezone.utc)),
+            error_context="log user purchase"
         )
         logger.info(f"Item effect for {item['name']} applied and purchase logged for user {user_id}.")
 
-def get_user_manager(supabase: Client = Depends(get_supabase_client)): return UserManager(supabase)
-def get_ai_manager(supabase: Client = Depends(get_supabase_client)): return AIManager(supabase)
-def get_contest_manager(supabase: Client = Depends(get_supabase_client)): return ContestManager(supabase)
-def get_shop_manager(supabase: Client = Depends(get_supabase_client)): return ShopManager(supabase)
+def get_user_manager(): return UserManager()
+def get_ai_manager(): return AIManager()
+def get_contest_manager(): return ContestManager()
+def get_shop_manager(): return ShopManager()
 
 @app.get("/")
 def read_root():
@@ -783,22 +803,16 @@ def update_profile_endpoint(user_id: str, profile_data: UserProfileUpdate, user_
 def request_payout_endpoint(payout_data: PayoutRequest, user_manager: UserManager = Depends(get_user_manager)):
     logger.info(f"Payout request from user {payout_data.user_id} for {payout_data.points_amount} points.")
     try:
-        supabase = get_supabase_client() # Get a fresh client for RPC, ensuring correct API key usage
-        value_eur = payout_data.points_amount / POINTS_TO_EUR_RATE
-        result = user_manager._execute_supabase_query( # Using user_manager's _execute_supabase_query
-            supabase.rpc('request_payout_function', { 
-                'p_user_id': payout_data.user_id, 
-                'p_points_amount': payout_data.points_amount, 
-                'p_value_in_eur': value_eur, 
-                'p_method': payout_data.method, 
-                'p_address': payout_data.address 
-            }),
-            "request payout RPC"
+        # Call the SQL function directly using _execute_pg_query
+        result = _execute_pg_query(
+            "SELECT request_payout_function(%s, %s, %s, %s, %s) AS result",
+            (payout_data.user_id, payout_data.points_amount, payout_data.points_amount / POINTS_TO_EUR_RATE, payout_data.method, payout_data.address),
+            fetch_one=True, error_context="request payout RPC"
         )
         
-        if result and isinstance(result, list) and len(result) > 0:
+        if result and result['result']:
             logger.info(f"Payout request successful for user {payout_data.user_id}.")
-            return {"status": "success", "message": result[0].get('message', "Your payout request has been sent and will be processed soon!")}
+            return {"status": "success", "message": result['result'].get('message', "Your payout request has been sent and will be processed soon!")}
         
         logger.error(f"Unexpected RPC return for request_payout_function for user {payout_data.user_id}: {result}")
         raise HTTPException(status_code=400, detail="Failed to process payout request. Check database function logs.")
@@ -912,9 +926,10 @@ async def vote_content_endpoint(content_id: int, req: VoteContentRequest, ai_man
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/contests/current/{user_id}")
-def get_current_contest_endpoint(user_id: str, contest_manager: ContestManager = Depends(get_contest_manager), user_manager: UserManager = Depends(get_user_manager)):
+def get_current_contest_endpoint(user_id: str, contest_manager: ContestManager = Depends(get_contest_manager)):
     try:
-        user_profile = user_manager.get_user_profile(user_id) # This will fetch profile data or return defaults
+        user_manager = UserManager() # Instance created here
+        user_profile = user_manager.get_user_profile(user_id)
         user_plan = SubscriptionPlan(user_profile.get('subscription_plan', SubscriptionPlan.FREE.value))
         contest = contest_manager.get_current_contest(user_plan)
         if not contest:
@@ -944,7 +959,7 @@ async def buy_shop_item_endpoint(req: ShopBuyRequest, shop_manager: ShopManager 
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/create-checkout-session")
-def create_checkout_session_endpoint(req: CreateSubscriptionRequest, supabase: Client = Depends(get_supabase_client)):
+def create_checkout_session_endpoint(req: CreateSubscriptionRequest):
     if not stripe.api_key: raise HTTPException(status_code=500, detail="Stripe not configured.")
     price_map = {
         'premium': STRIPE_PRICE_ID_PREMIUM,
@@ -954,25 +969,23 @@ def create_checkout_session_endpoint(req: CreateSubscriptionRequest, supabase: C
     if not price_id: raise HTTPException(status_code=400, detail="Invalid plan type specified.")
     
     try:
-        user_res = UserManager(supabase)._execute_supabase_query(
-            supabase.table('users').select('email, stripe_customer_id').eq('user_id', req.user_id).maybe_single(),
-            "fetch user for Stripe checkout"
-        )
-        if not user_res: raise HTTPException(status_code=404, detail="User not found.")
-        
-        user_data = user_res
-        customer_id = user_data.get('stripe_customer_id')
+        user_manager = UserManager()
+        user_profile_data = user_manager.get_user_profile(req.user_id) # This call ensures DB access works
+        user_email = user_profile_data.get('email') # Assuming email is retrieved by get_user_profile
+        user_stripe_customer_id = user_profile_data.get('stripe_customer_id')
+
+        customer_id = user_stripe_customer_id
         
         if not customer_id:
             logger.info(f"Creating new Stripe customer for user {req.user_id}.")
             customer = stripe.Customer.create(
-                email=user_data.get('email'),
+                email=user_email,
                 metadata={'user_id': req.user_id}
             )
             customer_id = customer.id
-            UserManager(supabase)._execute_supabase_query(
-                supabase.table('users').update({'stripe_customer_id': customer_id}).eq('user_id', req.user_id),
-                "update user with Stripe customer ID"
+            _execute_pg_query(
+                "UPDATE users SET stripe_customer_id = %s WHERE user_id = %s",
+                (customer_id, req.user_id), error_context="update user with Stripe customer ID"
             )
         
         checkout_session = stripe.checkout.Session.create(
@@ -997,7 +1010,7 @@ def create_checkout_session_endpoint(req: CreateSubscriptionRequest, supabase: C
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/stripe-webhook")
-async def stripe_webhook(request: Request, supabase: Client = Depends(get_supabase_client)):
+async def stripe_webhook(request: Request):
     payload = await request.body()
     sig_header = request.headers.get('stripe-signature')
 
@@ -1021,15 +1034,19 @@ async def stripe_webhook(request: Request, supabase: Client = Depends(get_supaba
     data_object = event['data']['object']
     logger.info(f"Received Stripe webhook event type: {event_type}")
 
+    # Use direct _execute_pg_query or UserManager/ShopManager methods that wrap it
+    user_manager = UserManager() 
+    shop_manager = ShopManager()
+
     if event_type == 'customer.subscription.created' or event_type == 'customer.subscription.updated':
         subscription = data_object
         customer_id = subscription.get('customer')
         price_id = subscription['items']['data'][0]['price']['id']
         status = subscription.get('status')
         
-        user_res = UserManager(supabase)._execute_supabase_query(
-            supabase.table('users').select('user_id').eq('stripe_customer_id', customer_id).maybe_single(),
-            "fetch user for subscription webhook"
+        user_res = _execute_pg_query(
+            "SELECT user_id FROM users WHERE stripe_customer_id = %s",
+            (customer_id,), fetch_one=True, error_context="fetch user for subscription webhook"
         )
         
         if user_res:
@@ -1042,15 +1059,15 @@ async def stripe_webhook(request: Request, supabase: Client = Depends(get_supaba
                 new_plan = SubscriptionPlan.ASSISTANT.value
             
             if status in ['active', 'trialing']:
-                UserManager(supabase)._execute_supabase_query(
-                    supabase.table('users').update({'subscription_plan': new_plan}).eq('user_id', user_id),
-                    "update user subscription plan"
+                _execute_pg_query(
+                    "UPDATE users SET subscription_plan = %s WHERE user_id = %s",
+                    (new_plan, user_id), error_context="update user subscription plan"
                 )
                 logger.info(f"User {user_id} subscription plan updated to {new_plan} (status: {status}).")
             else:
-                UserManager(supabase)._execute_supabase_query(
-                    supabase.table('users').update({'subscription_plan': SubscriptionPlan.FREE.value}).eq('user_id', user_id),
-                    "revert user subscription plan"
+                _execute_pg_query(
+                    "UPDATE users SET subscription_plan = %s WHERE user_id = %s",
+                    (SubscriptionPlan.FREE.value, user_id), error_context="revert user subscription plan"
                 )
                 logger.info(f"User {user_id} subscription plan reverted to FREE (status: {status}).")
         else:
@@ -1058,14 +1075,14 @@ async def stripe_webhook(request: Request, supabase: Client = Depends(get_supaba
 
     elif event_type == 'customer.subscription.deleted':
         customer_id = data_object.get('customer')
-        user_res = UserManager(supabase)._execute_supabase_query(
-            supabase.table('users').select('user_id').eq('stripe_customer_id', customer_id).maybe_single(),
-            "fetch user for deleted subscription webhook"
+        user_res = _execute_pg_query(
+            "SELECT user_id FROM users WHERE stripe_customer_id = %s",
+            (customer_id,), fetch_one=True, error_context="fetch user for deleted subscription webhook"
         )
         if user_res:
-            UserManager(supabase)._execute_supabase_query(
-                supabase.table('users').update({'subscription_plan': SubscriptionPlan.FREE.value}).eq('user_id', user_res['user_id']),
-                "revert user plan on subscription delete"
+            _execute_pg_query(
+                "UPDATE users SET subscription_plan = %s WHERE user_id = %s",
+                (SubscriptionPlan.FREE.value, user_res['user_id']), error_context="revert user plan on subscription delete"
             )
             logger.info(f"User {user_res['user_id']} subscription deleted, reverted to FREE plan.")
         else:
@@ -1077,14 +1094,12 @@ async def stripe_webhook(request: Request, supabase: Client = Depends(get_supaba
         item_id = payment_intent['metadata'].get('item_id')
         
         if user_id and item_id:
-            item_res = UserManager(supabase)._execute_supabase_query(
-                supabase.table('shop_items').select('*').eq('id', int(item_id)).maybe_single(),
-                "fetch item for payment intent succeeded"
+            item = _execute_pg_query(
+                "SELECT id, name, description, price_points, price_eur, item_type, effect, image_url, is_active FROM shop_items WHERE id = %s",
+                (int(item_id),), fetch_one=True, error_context="fetch item for payment intent succeeded"
             )
-            if item_res:
-                item = item_res
-                shop_manager = ShopManager(supabase)
-                await shop_manager._apply_item_effect(user_id, item, 'stripe', None, item['price_eur'])
+            if item:
+                await shop_manager._apply_item_effect(user_id, item, 'stripe', None, item.get('price_eur'))
                 logger.info(f"Payment intent succeeded for user {user_id}, item {item['name']}. Effect applied.")
             else:
                 logger.warning(f"Item {item_id} not found for successful payment intent for user {user_id}.")
