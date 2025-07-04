@@ -1,0 +1,2 @@
+[packages]
+apt = ["libpq-dev"] # Per i sistemi basati su Debian/Ubuntu (Nixpacks spesso usa questo)
