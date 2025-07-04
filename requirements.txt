@@ -90,3 +90,4 @@ yarl==1.20.1
 yfinance==0.2.64
 gunicorn
 uvicorn
+psycopg2-binary
