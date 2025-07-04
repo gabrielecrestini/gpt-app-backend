@@ -97,4 +97,3 @@ venv.bak/
 .vscode/
 *.json
 *.json
-.env.local
