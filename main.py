@@ -1110,3 +1110,4 @@ async def stripe_webhook(request: Request):
         logger.info(f"Unhandled Stripe event type: {event_type}")
 
     return Response(status_code=200)
+# Questo è un commento per forzare un nuovo deployment
